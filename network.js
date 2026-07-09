@@ -56,7 +56,7 @@ class Network {
 
   _startServer() {
     const { WebSocketServer } = require('ws');
-    this.wss = new WebSocketServer({ server: this.opts.server, path: '/monogun' });
+    this.wss = new WebSocketServer({ server: this.opts.server, path: '/nevil' });
     this.wss.on('connection', (ws) => this._attach(ws));
   }
 

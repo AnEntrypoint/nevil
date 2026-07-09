@@ -1,5 +1,5 @@
 /**
- * monogun.js — the monolithic composite.
+ * nevil.js — the monolithic composite.
  *
  * A single, from-scratch implementation covering the same ground as the
  * GUN ecosystem (GUN core + SEA + RAD + DAM/AXE), PLUS a hierarchical
