@@ -1,9 +1,3 @@
-.gm/pw-sock-*/
-.gm/exec-spool/.*
-.gm/exec-spool/in/
-.gm/exec-spool/out/
-.gm/last-dispatch-ts
-.gm/next-step.md
-.gm/turn-state.json
+.gm/
 test/tmp-*/
 node_modules/
