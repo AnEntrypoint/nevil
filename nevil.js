@@ -40,7 +40,7 @@ const { Keychain, KeyPair } = require('./keychain');
 const sea = require('./crypto');
 const { query } = require('./query');
 
-class MonoGun {
+class Nevil {
   constructor(opts = {}) {
     this.opts = opts;
     this.storage = new Storage({ ...opts, enableIndex: opts.enableSoulIndex });
@@ -327,4 +327,4 @@ class MonoGun {
   }
 }
 
-module.exports = MonoGun;
+module.exports = Nevil;

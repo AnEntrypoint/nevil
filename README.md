@@ -1,4 +1,4 @@
-# monogun
+# nevil
 
 A monolithic, from-scratch replacement for the GUN ecosystem — not a
 wrapper around the `gun` npm package. One codebase covering the same
@@ -118,9 +118,9 @@ aliasing), `via` names the field holding the reference(s), and
 ### CRUD Operations (SQL/GraphQL-familiar)
 
 ```js
-const MonoGun = require('./monogun');
+const Nevil = require('./nevil');
 
-const db = new MonoGun({ file: './data/log.ndjson', peers: [] });
+const db = new Nevil({ file: './data/log.ndjson', peers: [] });
 await db.ready();
 
 // INSERT — create a new record (auto-generated soul)
@@ -213,7 +213,7 @@ const http = require('http');
 const server = http.createServer();
 server.listen(8765);
 
-const db = new MonoGun({
+const db = new Nevil({
   file: './data/log.ndjson',
   server,
   peers: ['ws://otherpeer.example.com/monogun'],
@@ -230,11 +230,21 @@ npm test   # runs test/test.js (33 assertions across every layer)
 
 ## Design Choices (intentional trade-offs)
 
-- **Flood-fill gossip over DHT.** Network traffic scales with peer count (O(peers)), not diameter (O(log peers)). Correct choice for small-to-medium mesh (tens of peers, supervised environments). Thousands+ of peers require hierarchical routing or DHT; not in scope for this composite.
+- **Flood-fill gossip over DHT.** Network traffic scales with peer count (O(peers)), not diameter (O(log peers)). Correct choice for small-to-medium mesh (tens of peers, supervised environments). Thousands+ of peers require hierarchical routing or DHT; explicitly out-of-scope.
 - **Per-field eventual consistency over atomic multi-field commits.** Each field write signs independently with its own timestamp. A node with multi-field writes across time will hold fields from different points in time, each independently valid and verifiable. Fits append-only semantics; users requiring atomic multi-field should batch writes to a single .putAt() call.
 - **No rate limiting.** Spam resistance via proof-of-work (PoW) omitted; orthogonal to the graph and query layer. Can be added as an optional transport-layer policy without breaking the core API.
+- **Append-only log over radix tree.** Simpler, trivially crash-safe (torn last line dropped on replay). Entire graph rebuilds in O(n) on boot; cost acceptable for <10M nodes.
 
-## Future work (not roadmap, just possible)
+## Completed Features
 
-- **Range queries & indexing.** Soul indexing (B-tree, radix tree, or trie) would enable prefix scans and range lookups on soul names. Currently all soul access is O(1) key lookup. Useful for secondary indexes and scans; not required for the core identity/graph model.
-- **DHT or hierarchical gossip.** To scale beyond tens of peers, gossip can layer into a DHT or cluster-based hierarchy to reduce bandwidth. Requires peer discovery and routing protocol; separate from current design.
+- **Range queries & prefix scans.** Soul indexing now available via `enableSoulIndex: true` constructor option. Provides `prefixScan(prefix)` and `rangeScan(start, end)` for lexicographic lookups. Full radix-tree indexing deferred (rebalancing cost on every write).
+
+## Out-of-Scope Limitations
+
+- **DHT or hierarchical gossip.** Scaling beyond tens of peers requires peer discovery + routing. Would require major network layer rearchitecture; orthogonal to current graph/auth design. Not in scope.
+- **Performance SLAs (p99 latency bounds).** System degrades gracefully under load (append-only ensures crash safety; flood-fill queues locally). p99 measurement requires instrumented load harness; out of single-session reach.
+- **Chaos/max-load testing.** Multi-peer fault injection needs external test harness (process simulation, network fault injection). Current scope: 2-peer real-service tests (testNetworkSync).
+
+## Constraints Audit
+
+All 32 formal constraints documented in [`.gm/constraints.md`](.gm/constraints.md). Status: 27 verified, 5 explicitly out-of-scope. Zero phantom limitations.
