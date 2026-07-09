@@ -1,3 +1,4 @@
 .gm/
 test/tmp-*/
 node_modules/
+.gm/pw-sock-*/
