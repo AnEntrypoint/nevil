@@ -43,7 +43,7 @@ const { query } = require('./query');
 class MonoGun {
   constructor(opts = {}) {
     this.opts = opts;
-    this.storage = new Storage(opts);
+    this.storage = new Storage({ ...opts, enableIndex: opts.enableSoulIndex });
     this.graph = new Graph();
     this._ready = this._boot();
     this._identity = null; // { keychain, soul } once logged in / created
@@ -65,6 +65,7 @@ class MonoGun {
         fields[f] = node[f];
         ts[f] = this.graph.getState(soul)[f];
       }
+      if (this.storage.index) this.storage.index.add(soul);
       this.storage.persist(soul, fields, ts);
       this.network.broadcast({ type: 'put', soul, fields, ts });
     });
@@ -121,6 +122,26 @@ class MonoGun {
 
   async compact() {
     await this.storage.compact(this.graph);
+  }
+
+  // --- Soul indexing for range queries (optional) -------------------------
+
+  /**
+   * Prefix scan: find all souls starting with a prefix (e.g., 'user:').
+   * Requires enableSoulIndex: true in constructor options.
+   */
+  prefixScan(prefix) {
+    if (!this.storage.index) throw new Error('soul indexing disabled; set enableSoulIndex: true in constructor');
+    return this.storage.index.prefixMatch(prefix);
+  }
+
+  /**
+   * Range scan: find all souls in lexicographic range [start, end).
+   * Requires enableSoulIndex: true in constructor options.
+   */
+  rangeScan(start, end) {
+    if (!this.storage.index) throw new Error('soul indexing disabled; set enableSoulIndex: true in constructor');
+    return this.storage.index.rangeScan(start, end);
   }
 
   // --- GraphQL-shaped query surface + SQL/GraphQL aliases ---------------

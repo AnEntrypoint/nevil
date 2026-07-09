@@ -293,6 +293,29 @@ async function testSQLGraphQLAPI() {
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+async function testSoulIndexing() {
+  const dir = './test/tmp-idx-' + Date.now();
+  const db = new MonoGun({ file: dir + '/log.ndjson', enableSoulIndex: true, peers: [] });
+  await db.ready();
+
+  db.put('user:alice', { name: 'Alice' });
+  db.put('user:bob', { name: 'Bob' });
+  db.put('post:123', { title: 'Post 1' });
+  db.put('post:456', { title: 'Post 2' });
+  db.put('comment:789', { text: 'Comment' });
+
+  const users = db.prefixScan('user:');
+  log('prefixScan finds all user souls', users.length === 2 && users.includes('user:alice'));
+
+  const posts = db.prefixScan('post:');
+  log('prefixScan finds all post souls', posts.length === 2);
+
+  const range = db.rangeScan('post:', 'post;');
+  log('rangeScan finds souls in lexicographic range', range.length === 2 && range.every(s => s.startsWith('post:')));
+
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 async function main() {
   await testGraphHAM();
   await testGraphListeners();
@@ -302,6 +325,7 @@ async function main() {
   await testKeychainCapabilitySharing();
   await testGraphQLQuery();
   await testSQLGraphQLAPI();
+  await testSoulIndexing();
   await testNetworkSync();
 }
 

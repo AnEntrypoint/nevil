@@ -108,8 +108,41 @@ class BrowserLogStore {
 }
 
 /**
+ * SoulIndex — optional in-memory index for range queries and prefix scans.
+ * Not persisted; rebuilt on boot from the log. Keyed by soul for fast prefix
+ * lookups (e.g. all souls starting with 'user:' or 'post:').
+ */
+class SoulIndex {
+  constructor() {
+    this.souls = new Set(); // all known souls
+  }
+
+  add(soul) {
+    this.souls.add(soul);
+  }
+
+  prefixMatch(prefix) {
+    return Array.from(this.souls).filter((s) => s.startsWith(prefix)).sort();
+  }
+
+  rangeScan(start, end) {
+    return Array.from(this.souls)
+      .filter((s) => s >= start && s < end)
+      .sort();
+  }
+
+  rebuild(graph) {
+    this.souls.clear();
+    for (const soul of graph.nodes.keys()) {
+      this.souls.add(soul);
+    }
+  }
+}
+
+/**
  * Persistence facade used by the rest of the system. Wraps a log store
  * and knows how to replay it into a Graph, and how to persist new writes.
+ * Optionally maintains a SoulIndex for range-query support.
  */
 class Storage {
   constructor(opts = {}) {
@@ -118,6 +151,7 @@ class Storage {
     } else {
       this.log = new BrowserLogStore(opts.dbName || 'monogun');
     }
+    this.index = opts.enableIndex ? new SoulIndex() : null;
   }
 
   /** Replay the log into a fresh Graph on boot. */
@@ -126,6 +160,7 @@ class Storage {
     const g = new GraphClass();
     for (const entry of entries) {
       g.mergeNode(entry.soul, entry.fields, entry.ts);
+      if (this.index) this.index.add(entry.soul);
     }
     return g;
   }
@@ -133,6 +168,7 @@ class Storage {
   /** Persist a batch of graph writes (called after every accepted merge). */
   async persist(soul, fields, ts) {
     await this.log.appendEntries([{ soul, fields, ts }]);
+    if (this.index) this.index.add(soul);
   }
 
   /** Rewrite the log to just the current graph state — call periodically. */
@@ -142,7 +178,8 @@ class Storage {
       entries.push({ soul, fields: node.data, ts: node.state });
     }
     await this.log.compact(entries);
+    if (this.index) this.index.rebuild(graph);
   }
 }
 
-module.exports = { Storage, NodeLogStore, BrowserLogStore, isNode };
+module.exports = { Storage, StorageIndex: SoulIndex, NodeLogStore, BrowserLogStore, isNode };

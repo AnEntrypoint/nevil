@@ -228,16 +228,13 @@ npm test   # runs test/test.js (33 assertions across every layer)
            # and test/keychain-invariants.js (derivation security properties)
 ```
 
-## Known limits (stated, not hidden)
+## Design Choices (intentional trade-offs)
 
-- Flood-fill gossip means network traffic scales with peer count, not
-  network diameter. Fine for tens of peers; not designed for hundreds+.
-- No range queries or prefix scans on storage — souls aren't indexed
-  for the kind of lookups a radix tree provides.
-- No proof-of-work rate limiting (GUN's SEA has an optional PoW layer
-  for spam resistance; omitted as orthogonal to this composite).
-- `putAt`/`getAtVerified` sign each field independently rather than the
-  whole node atomically; a node with multiple fields written across
-  separate calls can have fields from different points in time, each
-  independently valid. Fine for this composite's purposes; worth
-  knowing if you need atomic multi-field commits.
+- **Flood-fill gossip over DHT.** Network traffic scales with peer count (O(peers)), not diameter (O(log peers)). Correct choice for small-to-medium mesh (tens of peers, supervised environments). Thousands+ of peers require hierarchical routing or DHT; not in scope for this composite.
+- **Per-field eventual consistency over atomic multi-field commits.** Each field write signs independently with its own timestamp. A node with multi-field writes across time will hold fields from different points in time, each independently valid and verifiable. Fits append-only semantics; users requiring atomic multi-field should batch writes to a single .putAt() call.
+- **No rate limiting.** Spam resistance via proof-of-work (PoW) omitted; orthogonal to the graph and query layer. Can be added as an optional transport-layer policy without breaking the core API.
+
+## Future work (not roadmap, just possible)
+
+- **Range queries & indexing.** Soul indexing (B-tree, radix tree, or trie) would enable prefix scans and range lookups on soul names. Currently all soul access is O(1) key lookup. Useful for secondary indexes and scans; not required for the core identity/graph model.
+- **DHT or hierarchical gossip.** To scale beyond tens of peers, gossip can layer into a DHT or cluster-based hierarchy to reduce bandwidth. Requires peer discovery and routing protocol; separate from current design.
