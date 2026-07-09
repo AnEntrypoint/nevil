@@ -1,0 +1,1 @@
+{"data":{"deviation_kind":"residual-dirty-tree","modified":10,"reason":"worktree dirty — modified=10 untracked=28 — commit or revert before residual scan; a push from a dirty tree orphans the unstaged delta","scan":"skipped","untracked":28},"next_dispatch_hint":"instruction","ok":true,"verb":"residual-scan"}
