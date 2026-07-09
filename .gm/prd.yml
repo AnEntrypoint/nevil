@@ -1,0 +1,50 @@
+- id: api-naming-sqlite-familiar
+  title: Align API method names to SQLite conventions where collision-free
+  description: Methods like `put`/`get` should mirror SQLite (insert/select/update/delete) for familiarity to SQLite users; check rename viability against existing call sites without breaking
+  witness: codesearch found `db.put`, `db.get`, `db.link` -- target query users expect `insert`/`select`/`update`; test.js line 142+
+  status: pending
+- id: query-selection-syntax
+  title: Enhance query(...) syntax to mirror GraphQL/SQL projection patterns
+  description: 'Current query shape accepts `select: [fields]` and nested `via` refs; add support for computed fields, filters, sorting, and aggregates to match GraphQL user expectations'
+  witness: test.js testGraphQLQuery shows query API is synchronous, no async resolution; expand surface
+  status: pending
+- id: schema-validation-graphql-compat
+  title: Add optional schema definition and query validation for GraphQL users
+  description: GraphQL users expect schema enforcement; add .schema() surface to declare types and validate puts/links against schema before persisting
+  witness: query.js resolveOne is untyped; no schema layer yet
+  status: pending
+- id: graphql-query-layer-mutations
+  title: Add mutation surface (create/update/delete) matching GraphQL mutation pattern
+  description: Current API has put/link/putAt; add named mutation methods (create, update, delete) that users already know from GraphQL
+  witness: monogun.js has no mutation surface named after GraphQL patterns; only raw put/link/putAt
+  status: pending
+- id: sql-where-clause-equiv
+  title: Add filtering/where-clause equivalent to query() for SQLite users
+  description: SQLite users expect WHERE filters in queries; add filter/where object to query() to enable predicate-based result filtering
+  witness: query.js resolveOne has no filter param; only selects and follows refs
+  status: pending
+- id: query-ordering-limit-offset
+  title: Add ORDER BY / LIMIT / OFFSET equivalents to query()
+  description: SQLite users expect sorting, limits, and pagination; add sort/limit/offset params to query selection
+  witness: query.js has no ordering or pagination; returns unordered results
+  status: pending
+- id: api-docs-familiar-terminology
+  title: Document API using SQLite/GraphQL terminology (SELECT, INSERT, UPDATE, DELETE, schema, query)
+  description: README.md currently explains in GUN terms; rewrite using SQLite/GraphQL parallels to bridge users from those systems
+  witness: README.md layer table uses 'soul', 'node', 'references' -- opaque to SQL/GraphQL users
+  status: pending
+- id: transaction-safety-semantics
+  title: Clarify and expose transaction boundaries that SQLite users expect
+  description: SQLite users expect ACID; document monogun's per-field eventual consistency vs atomic multi-field transactions, add atomic batch ops if missing
+  witness: monogun.js broadcasts field-by-field (line 65); README 'Known limits' mentions 'fields from different points in time'
+  status: pending
+- id: graphql-subscriptions-equiv
+  title: Add subscription surface matching GraphQL subscriptions/real-time updates
+  description: GraphQL users expect subscriptions for real-time; align .on() listeners to GraphQL subscription semantics
+  witness: monogun.js has .on(soul, fn) for listeners; expose as .subscribe() with GraphQL-familiar shape
+  status: pending
+- id: result-set-shape-normalization
+  title: Normalize query result shape to match GraphQL/SQL row format
+  description: Query results include 'soul'; SQLite users expect column names, not soul refs; add result-mapper option
+  witness: testGraphQLQuery shows result.soul in output; SQL users expect structured rows without addressing metadata
+  status: pending
