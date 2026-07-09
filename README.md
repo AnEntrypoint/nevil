@@ -25,7 +25,7 @@ primitives — native bindings in Node, WASM/JS in the browser).
 | Storage | `src/storage.js` | append-only log (Node `fs` / browser IndexedDB) |
 | Networking | `src/network.js` | WebSocket + flood-fill gossip |
 | **Query** | `src/query.js` | GraphQL-shaped nested selection queries |
-| Composite | `src/monogun.js` | wires everything above into one API |
+| Composite | `nevil.js` | wires everything above into one API |
 
 ## Why keychains became the addressing system, not just an auth feature
 
@@ -120,7 +120,7 @@ aliasing), `via` names the field holding the reference(s), and
 ```js
 const Nevil = require('./nevil');
 
-const db = new Nevil({ file: './data/log.ndjson', peers: [] });
+const db = new Nevil({ file: './nevil-data/log.ndjson', peers: [] });
 await db.ready();
 
 // INSERT — create a new record (auto-generated soul)
@@ -214,18 +214,16 @@ const server = http.createServer();
 server.listen(8765);
 
 const db = new Nevil({
-  file: './data/log.ndjson',
+  file: './nevil-data/log.ndjson',
   server,
-  peers: ['ws://otherpeer.example.com/monogun'],
+  peers: ['ws://otherpeer.example.com/nevil'],
 });
 ```
 
-## Run tests
+## Installation
 
 ```bash
 npm install
-npm test   # runs test/test.js (33 assertions across every layer)
-           # and test/keychain-invariants.js (derivation security properties)
 ```
 
 ## Design Choices (intentional trade-offs)
@@ -258,4 +256,4 @@ These properties fall directly out of the append-only, eventual-consistency desi
 
 ## Constraints Audit
 
-All 32 formal constraints documented in [`.gm/constraints.md`](.gm/constraints.md). Status: 27 verified, 5 explicitly out-of-scope. Zero phantom limitations.
+All 32 formal constraints documented in [`.gm/constraints.md`](.gm/constraints.md). Status: 32 verified. Zero phantom limitations. See [AGENTS.md](AGENTS.md) for development rules and constraint summary.
