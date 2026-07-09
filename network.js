@@ -40,6 +40,7 @@ class Network {
     this.seen = new Set(); // message ids already relayed, for flood-fill dedup
     this.seenOrder = []; // bounded FIFO so `seen` doesn't grow forever
     this.maxSeen = 5000;
+    this.metrics = { messagesReceived: 0, messagesSent: 0, bytesSent: 0, peersConnected: 0 };
 
     if (isNode && this.opts.server) this._startServer();
     for (const url of this.opts.peers || []) this._dial(url);
@@ -68,7 +69,11 @@ class Network {
 
   _attach(ws) {
     this.sockets.add(ws);
-    const handleClose = () => this.sockets.delete(ws);
+    this.metrics.peersConnected = this.sockets.size;
+    const handleClose = () => {
+      this.sockets.delete(ws);
+      this.metrics.peersConnected = this.sockets.size;
+    };
     const handleMessage = (raw) => {
       let msg;
       try {
@@ -77,6 +82,7 @@ class Network {
         return; // malformed frame, drop silently
       }
       if (!msg.id || !this._remember(msg.id)) return; // already seen, stop the flood here
+      this.metrics.messagesReceived++;
       this.onMessage(msg);
       this._relay(msg, ws); // flood to every other connected peer
     };
@@ -108,11 +114,17 @@ class Network {
       if (state === 1 /* OPEN */) {
         try {
           ws.send(data);
+          this.metrics.messagesSent++;
+          this.metrics.bytesSent += data.length;
         } catch {
           // dead socket, will be cleaned up by its own close handler
         }
       }
     }
+  }
+
+  getMetrics() {
+    return { ...this.metrics };
   }
 }
 

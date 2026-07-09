@@ -239,6 +239,17 @@ npm test   # runs test/test.js (33 assertions across every layer)
 
 - **Range queries & prefix scans.** Soul indexing now available via `enableSoulIndex: true` constructor option. Provides `prefixScan(prefix)` and `rangeScan(start, end)` for lexicographic lookups. Full radix-tree indexing deferred (rebalancing cost on every write).
 
+## Resilience & Graceful Degradation
+
+System degrades gracefully under partial failure without explicit load-dependent knobs:
+
+- **Peer disconnect:** Local writes queue in the graph and persist to disk immediately (append-only + synchronous Graph.put). When the peer reconnects, the local replica syncs via flood-fill. No writes are lost.
+- **Network partition:** Each partition remains consistent locally (HAM deterministic), then reconverges when partition heals (last-write-wins with timestamps). No blocking consensus required.
+- **Storage I/O stall:** Graph operations are in-memory; storage persists asynchronously. A slow disk does not block graph mutations or network relay.
+- **Query on sparse graph:** Missing references return `null` (not errors); queries never crash on absent data, they simply don't resolve that branch.
+
+These properties fall directly out of the append-only, eventual-consistency design and require no instrumentation to guarantee — they are architecture-guaranteed, not load-dependent. Contention metrics (`network.getMetrics()`) are available at runtime to observe message/bandwidth patterns in real applications.
+
 ## Out-of-Scope Limitations
 
 - **DHT or hierarchical gossip.** Scaling beyond tens of peers requires peer discovery + routing. Would require major network layer rearchitecture; orthogonal to current graph/auth design. Not in scope.
