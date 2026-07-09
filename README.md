@@ -372,6 +372,39 @@ These remain genuinely out-of-scope (require external infrastructure beyond scop
 - **Centralized consensus layer for full Byzantine fault tolerance.** Lamport clocks + eventual consistency handle temporary network partitions. Full Byzantine Byzantine consensus (malicious peers) requires distinct consensus protocol (separate project).
 - **Hierarchical PKI or centralized key management.** Keypear forward-only derivation handles key distribution. Centralized PKI infrastructure deferred (orthogonal concern).
 
+## CAP Theorem Modes (AP/CA/CP)
+
+Nevil's constructor accepts a `capMode` parameter to trade consistency, availability, and partition-tolerance:
+
+- **`capMode: 'AP'` (default)** — Availability + Partition tolerance. Writes succeed on any peer. On partition heal, writes from both sides merge via HAM last-write-wins. Best for offline-first apps and mesh networks.
+  
+- **`capMode: 'CA'`** — Consistency + Availability. Writes queue locally but require quorum acknowledgment before broadcast. If quorum becomes unavailable (peers down), writes block. Reads return last-known-consistent state (may be stale during recovery). Best for supervised environments with moderate availability requirements.
+  
+- **`capMode: 'CP'`** — Consistency + Partition tolerance. On partition detect (quorum loss), minority partition switches to read-only and refuses writes. Majority partition continues serving. Writes fail with "partition detected, switching to read-only" message on minority. Converges on heal. Best for hierarchical networks with a clear majority region.
+
+All modes share the same core API; the mode only affects broadcast semantics and quorum requirements. No consensus protocol or coordinator required.
+
+## Validation: Debugging and Troubleshooting Only
+
+This project uses **no synthetic tests**. All validation occurs via real execution and live measurement:
+
+- **Exec witness:** Core logic validated via `exec_js` / `browser` dispatch, executing real code paths with real input and checking output.
+- **Runtime metrics:** Network layer exposes `getMetrics()` returning p50/p90/p99 latencies, message/byte counts, peer health scores. Observed under live load.
+- **Chaos replay:** `tools/chaos-replay.js` deterministically replays recorded messages with fault injection (10% drop, 50ms jitter, peer kills), verifying consistency convergence without external harness.
+- **Code audit:** All 32 constraints verified statically in [`.gm/constraints.md`](.gm/constraints.md) — idempotence, disjoint state, no UB/races, type safety, uniform style, strict contracts, graceful degradation.
+
+Example: to witness AP mode merges causally independent writes on partition heal:
+```js
+const peer1 = new Nevil({ capMode: 'AP' });
+const peer2 = new Nevil({ capMode: 'AP' });
+peer1.put('soul', { x: 'value1' });
+peer2.put('soul', { y: 'value2' });
+peer1._applyRemote({ soul: 'soul', fields: peer2.get('soul'), ts: {} });
+// peer1.get('soul') now has both { x: 'value1', y: 'value2' }
+```
+
+No test framework, no mocks, no assertions. Debugging and troubleshooting only.
+
 ## Constraints Audit
 
 All 32 formal constraints documented in [`.gm/constraints.md`](.gm/constraints.md). Status: 32 verified. Zero phantom limitations. See [AGENTS.md](AGENTS.md) for development rules and constraint summary.

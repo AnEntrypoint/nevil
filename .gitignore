@@ -3,3 +3,5 @@ test/tmp-*/
 node_modules/
 .gm/pw-sock-*/
 load-test-logs/
+nevil-data/
+chaos-replay-logs/
