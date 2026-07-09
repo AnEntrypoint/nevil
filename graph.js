@@ -43,11 +43,13 @@ function hamWins(incomingTs, incomingVal, currentTs, currentVal) {
 }
 
 class Graph {
-  constructor() {
+  constructor(opts = {}) {
     // soul -> { field: value, ..., _meta: { field: { state: ts } } }
     this.nodes = new Map();
     this.listeners = new Map(); // soul -> Set<fn(node, changedFields)>
     this.wildcardListeners = new Set(); // fn(soul, node, changedFields)
+    this.localClock = 0; // Lamport clock: monotonically increasing counter
+    this.opts = opts;
   }
 
   _ensureNode(soul) {
@@ -78,9 +80,17 @@ class Graph {
   /**
    * Merge a whole node-shaped patch: { soul, field: value, ... } plus a
    * parallel timestamp map. This is the unit that gets sent over the wire
-   * and written to the storage log.
+   * and written to the storage log. Optional lamportClock for external messages.
    */
-  mergeNode(soul, fields, timestamps) {
+  mergeNode(soul, fields, timestamps, lamportClock) {
+    // Lamport clock ordering: if incoming clock is provided, it's an external message
+    if (lamportClock !== undefined) {
+      if (lamportClock > this.localClock) {
+        this.localClock = lamportClock;
+      }
+      this.localClock++; // increment after receiving external message
+    }
+
     const changed = [];
     for (const field of Object.keys(fields)) {
       const ts = timestamps[field];
@@ -92,12 +102,13 @@ class Graph {
     return changed;
   }
 
-  /** Convenience for local writes: stamps every field with now(). */
+  /** Convenience for local writes: stamps every field with now() and increments localClock. */
   put(soul, fields) {
     const now = Date.now() + Math.random() / 1000; // sub-ms jitter avoids same-ms tie floods
     const timestamps = {};
     for (const f of Object.keys(fields)) timestamps[f] = now;
-    return this.mergeNode(soul, fields, timestamps);
+    this.localClock++; // increment on every local write
+    return this.mergeNode(soul, fields, timestamps); // don't pass lamportClock; it's a local write
   }
 
   get(soul) {

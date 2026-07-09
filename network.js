@@ -46,7 +46,9 @@ class Network {
     this.writeRateScale = 1.0; // adaptive backpressure: scale factor for batch size
     this.dhtTable = []; // append-only routing table for multi-level DHT
     this.peerHealthScores = new Map(); // peerId -> {latency, loss, lastSeen}
-    this.reputationCache = new Map(); // peerId -> total reputation sum
+    this.reputationLedger = []; // append-only: {peerId, delta, reason, ts}
+    this.reputationCache = new Map(); // peerId -> total reputation sum (sum of all deltas)
+    this.messageQueue = []; // messages queued from throttled peers
 
     if (isNode && this.opts.server) this._startServer();
     for (const url of this.opts.peers || []) this._dial(url);
@@ -110,9 +112,6 @@ class Network {
         this.metrics.powDropped = (this.metrics.powDropped || 0) + 1;
         return; // PoW failed, drop silently
       }
-      this.metrics.messagesReceived++;
-      const recvMs = Date.now() + Math.random() / 1000 - recvStart;
-      this._recordLatency('receive_ms', recvMs);
       // Reputation gossip: update cache if message includes reputation data
       if (msg.reputationLedger && Array.isArray(msg.reputationLedger)) {
         for (const entry of msg.reputationLedger) {
@@ -120,6 +119,23 @@ class Network {
           this.reputationCache.set(entry.peerId, sum + entry.delta);
         }
       }
+      // Throttle gating: check sender reputation and decide accept/queue/drop
+      const senderId = msg.sender || 'unknown';
+      const throttleState = this.getThrottleState(senderId);
+      if (throttleState === 'drop') {
+        this.metrics.messagesDropped = (this.metrics.messagesDropped || 0) + 1;
+        return; // drop low-reputation sender silently
+      }
+      if (throttleState === 'queue') {
+        // queue the message; relay later when sender reputation recovers
+        this.messageQueue = this.messageQueue || [];
+        this.messageQueue.push({ msg, receivedAt: Date.now() });
+        return;
+      }
+      // throttleState === 'accept': process normally
+      this.metrics.messagesReceived++;
+      const recvMs = Date.now() + Math.random() / 1000 - recvStart;
+      this._recordLatency('receive_ms', recvMs);
       this.onMessage(msg);
       this._relay(msg, ws); // flood to every other connected peer
     };
@@ -136,8 +152,8 @@ class Network {
   }
 
   /** Send a message to every connected peer, marking it seen locally first. */
-  broadcast(payload) {
-    const msg = { id: randomId(), ...payload };
+  broadcast(payload, lamportClock) {
+    const msg = { id: randomId(), lamportClock: lamportClock || 0, ...payload };
     this._remember(msg.id);
     this._relay(msg, null);
     return msg;
@@ -205,8 +221,16 @@ class Network {
     const data = JSON.stringify(msg);
     // Update adaptive backpressure before relay
     this._updateBackpressure();
+
+    // DHT routing: route message via geohash bucket or fallback to broadcast
+    const targetPeers = this._selectRoutingPeers(msg);
+
     for (const ws of this.sockets) {
       if (ws === exceptSocket) continue;
+      // Only send if peer is in target list (DHT-routed)
+      const peerKey = this._getPeerKey(ws);
+      if (!targetPeers.has(peerKey) && this.opts.dhtEnabled !== false) continue;
+
       const state = isNode ? ws.readyState : ws.readyState;
       if (state === 1 /* OPEN */) {
         try {
@@ -220,6 +244,84 @@ class Network {
         }
       }
     }
+  }
+
+  _getPeerKey(ws) {
+    // Get unique identifier for peer (address:port or UUID in browser)
+    if (isNode && ws._socket) {
+      return ws._socket.remoteAddress + ':' + ws._socket.remotePort;
+    }
+    return ws.url || 'unknown';
+  }
+
+  _selectRoutingPeers(msg) {
+    // DHT-aware peer selection: route to K nearest peers by geohash bucket
+    // Fallback to broadcast if K peers unavailable
+    const K = this.opts.dhtK || 3; // number of nearest peers per bucket
+    const L = this.opts.dhtL || 2; // adjacent buckets to gossip to
+    const selectedPeers = new Set();
+
+    // If DHT disabled, broadcast to all connected peers
+    if (this.opts.dhtEnabled === false) {
+      for (const ws of this.sockets) {
+        selectedPeers.add(this._getPeerKey(ws));
+      }
+      // Also include peers from health scores if no active sockets
+      if (selectedPeers.size === 0) {
+        for (const peerId of this.peerHealthScores.keys()) {
+          selectedPeers.add(peerId);
+        }
+      }
+      return selectedPeers;
+    }
+
+    const soul = msg.soul || msg.id;
+    if (!soul) {
+      return new Set(Array.from(this.sockets).map(ws => this._getPeerKey(ws)));
+    }
+
+    // Compute geohash prefix (simplified: use first 4 chars of soul hex hash)
+    const geohashPrefix = this._computeGeohash(soul);
+
+    // Find K healthiest peers in this bucket
+    const healthyPeers = this.getHealthyPeers();
+    const bucketed = healthyPeers.filter(p => {
+      const health = this.peerHealthScores.get(p);
+      return health && health.latency < (this.opts.maxLatency || 500) && health.loss < 0.1;
+    });
+
+    // Add K nearest
+    for (let i = 0; i < Math.min(K, bucketed.length); i++) {
+      selectedPeers.add(bucketed[i]);
+    }
+
+    // Add L adjacent buckets for healing
+    for (let i = 0; i < L && healthyPeers.length > K + i; i++) {
+      selectedPeers.add(healthyPeers[K + i]);
+    }
+
+    // Fallback: if K peers < threshold, broadcast to all
+    if (selectedPeers.size < K / 2) {
+      for (const peerId of this.peerHealthScores.keys()) {
+        selectedPeers.add(peerId);
+      }
+    }
+
+    return selectedPeers;
+  }
+
+  _computeGeohash(soul) {
+    // Simplified geohash: use first 4 chars of soul if hex, else hash it
+    if (this._isKeychainDerived(soul)) {
+      return soul.substring(0, 4);
+    }
+    // Fallback: simple string hash
+    let hash = 0;
+    for (let i = 0; i < Math.min(soul.length, 4); i++) {
+      hash = ((hash << 5) - hash) + soul.charCodeAt(i);
+      hash |= 0; // convert to int
+    }
+    return (hash >>> 0).toString(16).substring(0, 4);
   }
 
   _recordLatency(op, ms) {
@@ -295,6 +397,38 @@ class Network {
   /** Get cached reputation for peer. */
   getReputationCache(peerId) {
     return this.reputationCache.get(peerId) || 0;
+  }
+
+  /** Record reputation delta (append-only). Reasons: 'good', 'malformed', 'replay', 'byzantine', 'routing-help'. */
+  updateReputation(peerId, delta, reason = 'good') {
+    const entry = { peerId, delta, reason, timestamp: Date.now() };
+    this.reputationLedger.push(entry);
+    const currentRep = this.reputationCache.get(peerId) || 0;
+    this.reputationCache.set(peerId, currentRep + delta);
+    return entry;
+  }
+
+  /** Get current reputation score (sum of all deltas). */
+  getReputation(peerId) {
+    return this.reputationCache.get(peerId) || 0;
+  }
+
+  /** Get reputation ledger entries for peer. */
+  getReputationLedger(peerId) {
+    return this.reputationLedger.filter(e => e.peerId === peerId);
+  }
+
+  /** Decide message throttle state: accept (>=0), queue ([-10,0)), or drop (<-10). */
+  getThrottleState(peerId) {
+    const rep = this.getReputation(peerId);
+    if (rep >= 0) return 'accept';
+    if (rep < -10) return 'drop';
+    return 'queue';
+  }
+
+  /** Check if peer is in Byzantine isolation (reputation < threshold). */
+  isByzantineIsolated(peerId, threshold = -20) {
+    return this.getReputation(peerId) < threshold;
   }
 }
 

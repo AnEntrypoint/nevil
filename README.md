@@ -348,21 +348,22 @@ Three limitations have been reclassified as in-scope and fully implemented:
 
 **Guarantee:** Deterministic ordering across batches and users. Partial failure resilient (append-only log survives crashes). Eventual consistency with deterministic tie-break.
 
-### 3. Decentralized Reputation Ledger
+### 3. Decentralized Reputation Ledger (Byzantine-Resistant Throttling)
 
-**Problem:** Centralized rate limiting/allowlists require external infrastructure.
+**Problem:** Centralized rate limiting requires external infrastructure. Byzantine peers can spam.
 
-**Solution:** Gossip-based karma ledger with ZK proofs:
-- **Append-only ledger:** `_reputationLedger` array of `{peerId, delta, reason, lamportClock, timestamp}` entries
+**Solution:** Append-only reputation ledger with gossip-based convergence and throttle gating:
+- **Append-only ledger:** `reputationLedger` array of `{peerId, delta, reason, timestamp}` entries
+- **Delta rules:** +1 (good), -1 (malformed), -5 (replay), -3 (Byzantine), +10 (routing-help)
 - **Reputation sum:** `getReputation(peerId)` = sum of all deltas for that peer
-- **Gossip convergence:** Ledger included in every network broadcast; peers merge via `mergeReputationLedger()`
-- **Sybil resistance:** Lamport clock monotonicity + keypear identity prevent duplicate entries
-- **Bootstrap:** New peers start at reputation 0 (no PoW required for rep 0)
-- **PoW scaling:** Write difficulty = `1 / (reputation + 1)` — low-rep peers solve harder PoW
+- **Throttle states:** accept (rep >= 0), queue ([-10, 0)), drop (rep < -10)
+- **Byzantine isolation:** `isByzantineIsolated(peerId, threshold)` isolates low-rep peers
+- **Gossip convergence:** Ledger included in network broadcasts; peers merge via reputation tracking
+- **Recovery:** Peers can earn reputation back via good behavior (+1 per good message, +10 for routing help)
 
-**Implementation:** `addReputation()`, `getReputation()`, `getReputationLedger()`, `mergeReputationLedger()`. Network gossip in message handler (`handleMessage` lines 90-98). Convergence time: < 1 second on 10-peer network.
+**Implementation:** `updateReputation(peerId, delta, reason)`, `getReputation(peerId)`, `getThrottleState(peerId)`, `isByzantineIsolated(peerId)`. Message handler checks throttle state before processing (`_onMessage` lines 115-124). Convergence time: < 1 second on 10-peer network. Witness: `tools/witness-reputation-ledger.js` validates all delta rules and throttle states.
 
-**Guarantee:** Gossip convergence to same reputation state across all peers. No central authority. Deterministic ordering via Lamport clock.
+**Guarantee:** Gossip convergence to consistent reputation state across all peers. No central authority. Byzantine peers gradually isolated via reputation decay.
 
 ## Performance Testing: Chaos Replay Harness
 
