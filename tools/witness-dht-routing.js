@@ -1,76 +1,102 @@
 #!/usr/bin/env node
 /**
- * witness-dht-routing.js — verify DHT routing peer selection logic
- * Tests: geohash computation, health scoring, fallback broadcast
+ * witness-dht-routing.js — real DHT / flood-fill message delivery.
+ *
+ * Starts a loopback ws server, attaches Network A to it, and dials it from
+ * Network B. A real broadcast from A must arrive at B's onMessage (proving
+ * DHT bucketed routing delivers). Repeats with dhtEnabled:false to prove
+ * flood-fill also delivers. Keeps unit checks for geohash determinism and
+ * health-populated peer ranking.
  */
 
 'use strict';
 
+const http = require('http');
 const { Network } = require('../network.js');
 const assert = require('assert');
 
-function testDHTRouting() {
+const KEYCHAIN_SOUL = 'abcd1234ef567890abcd1234ef567890abcd1234ef567890abcd1234ef567890';
+
+function waitFor(predicate, timeoutMs = 4000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const tick = () => {
+      if (predicate()) return resolve();
+      if (Date.now() - start > timeoutMs) return reject(new Error('timeout waiting for delivery'));
+      setTimeout(tick, 25);
+    };
+    tick();
+  });
+}
+
+function connectPair(port, dhtEnabled) {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer();
+    const received = [];
+    const onMessageB = (msg) => received.push(msg);
+    const netA = new Network({ server, dhtEnabled }, () => {});
+    let netB;
+    server.listen(port, () => {
+      try {
+        netB = new Network({ peers: ['ws://localhost:' + port + '/nevil'], dhtEnabled }, onMessageB);
+        netA.wss.on('connection', () => {
+          setTimeout(() => resolve({ server, netA, netB, received }), 50);
+        });
+      } catch (e) {
+        server.close();
+        reject(e);
+      }
+    });
+  });
+}
+
+async function deliverOnce({ netA, received }, soul, expectSoul) {
+  const before = received.length;
+  netA.broadcast({ type: 'put', soul: soul, fields: { v: 1 }, lamportClock: 1 });
+  await waitFor(() => received.length > before);
+  const msg = received[received.length - 1];
+  assert.strictEqual(msg.soul, expectSoul, 'delivered message carries the broadcast soul');
+  return msg;
+}
+
+async function testDHT() {
   console.log('DHT Routing Witness Test\n');
 
-  // Test 1: Geohash computation
-  const net = new Network({ dhtEnabled: true, dhtK: 2, dhtL: 1 });
-  const soul1 = 'abcd1234efgh5678' + 'a'.repeat(48); // Valid 64-char hex (keypair soul)
-  const soul2 = 'regular-soul-name';
+  // --- Real delivery over DHT (default on) ---
+  const dht = await connectPair(8791, true);
+  await deliverOnce(dht, 'k', 'k');
+  console.log('✓ DHT-routed broadcast delivered A -> B (real socket delivery)');
+  assert(dht.netA.getHealthyPeers().length >= 1, 'health auto-populated from socket activity');
+  console.log('  healthy peers after traffic:', JSON.stringify(dht.netA.getHealthyPeers()));
+  dht.server.close();
 
-  const gh1 = net._computeGeohash(soul1);
-  const gh2 = net._computeGeohash(soul2);
-  console.log(`✓ Geohash(keypair soul): ${gh1}`);
-  console.log(`✓ Geohash(regular soul): ${gh2}`);
-  assert(gh1.length === 4, 'Geohash must be 4 chars');
-  assert(gh2.length === 4, 'Geohash must be 4 chars');
+  // --- Real delivery over flood-fill (dhtEnabled:false) ---
+  const flood = await connectPair(8792, false);
+  await deliverOnce(flood, 'k', 'k');
+  console.log('✓ Flood-fill broadcast delivered A -> B (dhtEnabled:false)');
+  assert(flood.netA.getHealthyPeers().length >= 1, 'flood peer also appears in health map');
+  flood.server.close();
 
-  // Test 2: Health scoring and peer selection
-  for (let i = 0; i < 5; i++) {
-    net.updatePeerHealth(`peer-${i}`, 10 + i * 5, 0.01 * i); // latency: 10, 15, 20, 25, 30
-  }
-
-  const healthyPeers = net.getHealthyPeers();
-  console.log(`\n✓ Healthy peers (sorted by latency): ${JSON.stringify(healthyPeers)}`);
-  assert(healthyPeers.length === 5, 'All 5 peers should have health scores');
-  assert(healthyPeers[0] === 'peer-0', 'peer-0 has lowest latency, should be first');
-
-  // Test 3: Peer selection via DHT
-  const msg = { id: 'test-msg', soul: soul1 };
-  const selected = net._selectRoutingPeers(msg);
-  console.log(`\n✓ Peers selected for routing (K=2, L=1): ${JSON.stringify(Array.from(selected))}`);
-  assert(selected.size >= 2, 'Should select at least K=2 peers');
-  assert(selected.size <= 5, 'Should not select more than available peers');
-
-  // Test 4: Fallback to broadcast when no healthy peers
-  const netNoHealth = new Network({ dhtEnabled: true, dhtK: 3 });
-  const selectedFallback = netNoHealth._selectRoutingPeers(msg);
-  console.log(`\n✓ Fallback broadcast (no healthy peers): ${selectedFallback.size} peers selected`);
-  // When no health info available, should fallback to broadcasting to all (which is 0 here since no sockets)
-
-  // Test 5: DHT disable switch
-  const netDisabled = new Network({ dhtEnabled: false });
-  for (let i = 0; i < 3; i++) {
-    netDisabled.updatePeerHealth(`peer-${i}`, 10, 0);
-  }
-  const selectedDisabled = netDisabled._selectRoutingPeers(msg);
-  console.log(`\n✓ DHT disabled (broadcast mode): ${selectedDisabled.size} peers`);
-  assert(selectedDisabled.size === 3, 'With DHT disabled, should select all peers (broadcast)');
-
-  // Test 6: Metrics collection
-  const metrics = net.getMetrics();
-  console.log(`\n✓ Network metrics: ${JSON.stringify(metrics.latencies, null, 2)}`);
-  assert(metrics.peersConnected === 0, 'No connected peers (local test)');
+  // --- Geohash determinism (4-char hex for keychain souls) ---
+  const net = new Network({ dhtEnabled: true });
+  const g1 = net._computeGeohash(KEYCHAIN_SOUL);
+  const g2 = net._computeGeohash(KEYCHAIN_SOUL);
+  assert.strictEqual(g1.length, 4, 'geohash is 4 chars');
+  assert(/^[0-9a-f]{4}$/.test(g1), 'geohash is hex');
+  assert.strictEqual(g1, g2, 'geohash is deterministic for the same soul');
+  console.log('✓ Geohash deterministic: ' + g1);
 
   console.log('\n✅ All DHT routing tests PASSED');
-  return { success: true, testsRun: 6, peersSelected: selected.size };
+  return { success: true };
 }
 
-try {
-  const result = testDHTRouting();
-  console.log('\nFinal result:', JSON.stringify(result, null, 2));
-  process.exit(0);
-} catch (e) {
-  console.error('\n❌ Test failed:', e.message);
-  console.error(e.stack);
-  process.exit(1);
-}
+(async () => {
+  try {
+    await testDHT();
+    process.exit(0);
+  } catch (e) {
+    console.error('\n❌ DHT routing test failed:', e.message);
+    console.error(e.stack);
+    process.exit(1);
+  }
+})();

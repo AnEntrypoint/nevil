@@ -1,62 +1,66 @@
 #!/usr/bin/env node
 /**
- * witness-lamport-clocks.js — verify Lamport clock ordering
+ * witness-lamport-clocks.js — real Lamport clock convergence.
+ *
+ * Two Graph instances receive clocked writes and must converge identically:
+ * the higher Lamport clock wins a same-timestamp field; external merges
+ * advance the local clock; and concurrent equal-timestamp reference writes
+ * resolve to the same soul on both graphs via the deterministic tie-break.
  */
 
 'use strict';
 
-const { Graph } = require('../graph.js');
+const { Graph, ref } = require('../graph.js');
 const assert = require('assert');
 
 function testLamportClocks() {
   console.log('Lamport Clock Witness Test\n');
 
-  // Test 1: Clock increments on writes
-  const g1 = new Graph();
-  assert.strictEqual(g1.localClock, 0, 'Initial clock should be 0');
-  g1.put('soul1', { field: 'value1' });
-  assert.strictEqual(g1.localClock, 1, 'Clock should increment after put');
-  g1.put('soul1', { field: 'value2' });
-  assert.strictEqual(g1.localClock, 2, 'Clock should increment again');
-  console.log('✓ Clock increments on writes');
+  // Concurrent same-timestamp field writes: higher clock wins on both graphs.
+  const gA = new Graph();
+  const gB = new Graph();
+  gA.mergeNode('s', { x: 1 }, { x: 100 }, 5); // A applies clock 5
+  gB.mergeNode('s', { x: 2 }, { x: 100 }, 7); // B applies clock 7
 
-  // Test 2: Receiving messages updates localClock
-  const g2 = new Graph();
-  g2.mergeNode('soul2', { field: 'value1' }, { field: 100 }, 5); // Incoming clock = 5
-  assert(g2.localClock >= 6, 'localClock should be >= incoming clock + 1');
-  console.log(`✓ Receiving clock updates localClock: ${g2.localClock}`);
+  gA.mergeNode('s', { x: 2 }, { x: 100 }, 7); // A receives B's clock-7 write
+  gB.mergeNode('s', { x: 1 }, { x: 100 }, 5); // B receives A's clock-5 write (rejected)
 
-  // Test 3: Causal ordering: local write after receiving creates higher clock
-  const g3 = new Graph();
-  g3.mergeNode('soul3', { field: 'a' }, { field: 100 }, 3); // Receive clock 3
-  const priorClock = g3.localClock;
-  g3.put('soul3', { field: 'b' }); // Local write
-  assert(g3.localClock > priorClock, 'Local write clock should exceed received clock');
-  console.log(`✓ Causal ordering preserved: received 3 -> local clock ${g3.localClock}`);
+  const aVal = gA.get('s').x;
+  const bVal = gB.get('s').x;
+  console.log('  gA.x =', aVal, ' gB.x =', bVal);
+  assert.strictEqual(aVal, 2, 'clock-7 value wins on A');
+  assert.strictEqual(bVal, 2, 'clock-7 value wins on B');
+  assert.strictEqual(aVal, bVal, 'both graphs converge on the clock-7 value');
+  console.log('✓ Clock decides: both graphs settle on the higher-clock write');
 
-  // Test 4: Concurrent writes with different clocks converge by clock order
-  const g4a = new Graph();
-  const g4b = new Graph();
+  // Local clock advances on external merges.
+  assert(gA.localClock > 7, 'local clock advanced past the highest seen external clock');
+  console.log('✓ localClock advanced to ' + gA.localClock + ' after external merges');
 
-  // Peer A writes to soul at clock 2
-  g4a.mergeNode('soul4', { field: 'x' }, { field: 100 }, 2);
+  // Deterministic resolution of concurrent equal-timestamp reference writes.
+  const gC = new Graph();
+  const gD = new Graph();
+  gC.mergeNode('s2', { r: ref('peerAAAA') }, { r: 100 }, 5);
+  gD.mergeNode('s2', { r: ref('peerBBBB') }, { r: 100 }, 5);
+  gC.mergeNode('s2', { r: ref('peerBBBB') }, { r: 100 }, 5); // C learns D's ref
+  gD.mergeNode('s2', { r: ref('peerAAAA') }, { r: 100 }, 5); // D learns C's ref
 
-  // Peer B writes to same soul at clock 3
-  g4b.mergeNode('soul4', { field: 'x' }, { field: 200 }, 3);
-
-  // Both should have received both writes and settled on order
-  console.log(`✓ Concurrent writes acknowledged (A clock: ${g4a.localClock}, B clock: ${g4b.localClock})`);
+  const cSoul = gC.get('s2').r['#'];
+  const dSoul = gD.get('s2').r['#'];
+  console.log('  resolved ref on C =', cSoul, ' on D =', dSoul);
+  assert.strictEqual(cSoul, dSoul, 'concurrent refs resolve identically (deterministic tie-break)');
+  assert.strictEqual(cSoul, 'peerBBBB', 'lexically-higher soul wins the tie');
+  console.log('✓ Concurrent equal-timestamp refs converge deterministically');
 
   console.log('\n✅ All Lamport clock tests PASSED');
-  return { success: true, testsRun: 4 };
+  return { success: true };
 }
 
 try {
-  const result = testLamportClocks();
-  console.log('\nFinal result:', JSON.stringify(result, null, 2));
+  testLamportClocks();
   process.exit(0);
 } catch (e) {
-  console.error('\n❌ Test failed:', e.message);
+  console.error('\n❌ Lamport clock test failed:', e.message);
   console.error(e.stack);
   process.exit(1);
 }

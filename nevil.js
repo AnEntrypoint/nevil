@@ -48,7 +48,6 @@ class Nevil {
     this._ready = this._boot();
     this._identity = null; // { keychain, soul } once logged in / created
     this._lamportClock = 0; // global lamport clock for cross-batch ACID
-    this._reputationLedger = []; // append-only karma ledger: {peerId, delta, reason, lamportClock, zkProof}
   }
 
   async _boot() {
@@ -61,6 +60,7 @@ class Nevil {
     // Every local write that actually changes state gets persisted and gossiped.
     this._unsubAny = this.graph.onAny((soul, node, changedFields) => {
       if (this._suppressBroadcast) return; // set while applying a remote write
+      this._lamportClock++; // advance global clock on every local (gossiped) write
       const fields = {};
       const ts = {};
       for (const f of changedFields) {
@@ -70,7 +70,7 @@ class Nevil {
       if (this.storage.index) this.storage.index.add(soul);
       this.storage.persist(soul, fields, ts);
       // Gossip reputation ledger along with graph writes
-      let msg = { type: 'put', soul, fields, ts, reputationLedger: this._reputationLedger, lamportClock: this._lamportClock };
+      let msg = { type: 'put', soul, fields, ts, reputationLedger: this.network.reputationLedger, lamportClock: this._lamportClock };
       // Byzantine resilience: attach sender (identity soul) + signature if identity is set
       if (this._identity) {
         msg.sender = this._identity.soul;
@@ -78,7 +78,7 @@ class Nevil {
         delete msgCopy.id;
         delete msgCopy.sender;
         delete msgCopy.signature;
-        const msgBody = JSON.stringify(msgCopy);
+        const msgBody = JSON.stringify(msgCopy, Object.keys(msgCopy).sort());
         const keyPair = this._identity.keychain.get();
         if (keyPair.writable) {
           const sig = keyPair.sign(Buffer.from(msgBody));
@@ -97,7 +97,8 @@ class Nevil {
 
   _applyRemote(msg) {
     this._suppressBroadcast = true; // avoid re-broadcasting what we just received
-    const changed = this.graph.mergeNode(msg.soul, msg.fields, msg.ts);
+    const changed = this.graph.mergeNode(msg.soul, msg.fields, msg.ts, msg.lamportClock);
+    if (msg.lamportClock && msg.lamportClock > this._lamportClock) this._lamportClock = msg.lamportClock;
     this._suppressBroadcast = false;
     if (changed.length) {
       // persist accepted remote writes too, so every peer's disk log is a full replica
@@ -310,8 +311,10 @@ class Nevil {
       const sig = keyPair.sign(Buffer.from(JSON.stringify(v)));
       signed[k] = { v, sig: sig.toString('hex') };
     }
-    signed._owner = this._identity.soul;
-    signed._path = path;
+    const ownerSig = keyPair.sign(Buffer.from(JSON.stringify(this._identity.soul)));
+    signed._owner = { v: this._identity.soul, sig: ownerSig.toString('hex') };
+    const pathSig = keyPair.sign(Buffer.from(JSON.stringify(path)));
+    signed._path = { v: path, sig: pathSig.toString('hex') };
     this.put(subSoul, signed);
     return subSoul;
   }
@@ -323,10 +326,6 @@ class Nevil {
     const ownerKeyPair = new KeyPair({ publicKey: Buffer.from(subSoul, 'hex'), scalar: null });
     const out = {};
     for (const [k, v] of Object.entries(node)) {
-      if (k === '_owner' || k === '_path') {
-        out[k] = v;
-        continue;
-      }
       if (v && typeof v === 'object' && v.sig) {
         const ok = ownerKeyPair.verify(Buffer.from(JSON.stringify(v.v)), Buffer.from(v.sig, 'hex'));
         out[k] = ok ? v.v : undefined;
@@ -359,47 +358,31 @@ class Nevil {
     return this.putAt(batchPath, fields);
   }
 
-  /** Add reputation delta to peer's karma ledger (append-only). */
+  /** Add reputation delta to peer's karma ledger (delegates to network's ledger). */
   addReputation(peerId, delta, reason = '') {
-    const entry = {
-      peerId,
-      delta,
-      reason,
-      lamportClock: ++this._lamportClock,
-      timestamp: Date.now()
-    };
-    this._reputationLedger.push(entry);
-    // Persist to graph under ['reputation', peerId]
+    this._lamportClock++;
+    const entry = this.network.updateReputation(peerId, delta, reason || 'good');
+    // Persist to graph under ['reputation', peerId] for visibility
     const repPath = ['reputation', peerId];
     this.put(repPath.join(':'), entry);
     return entry;
   }
 
-  /** Get total reputation for a peer (sum all deltas for that peer). */
+  /** Get total reputation for a peer (delegates to network's ledger). */
   getReputation(peerId) {
-    return this._reputationLedger
-      .filter(e => e.peerId === peerId)
-      .reduce((sum, e) => sum + e.delta, 0);
+    return this.network.getReputation(peerId);
   }
 
-  /** Get all reputation entries (gossip sync surface). */
+  /** Get all reputation entries (gossip sync surface — the network's live ledger). */
   getReputationLedger() {
-    return this._reputationLedger;
+    return this.network.reputationLedger;
   }
 
-  /** Merge remote reputation entries into local ledger (for gossip). */
+  /** Merge remote reputation entries into the network ledger (for gossip). */
   mergeReputationLedger(entries) {
-    const seen = new Set(this._reputationLedger.map(e => `${e.peerId}:${e.lamportClock}`));
     for (const entry of entries) {
-      const key = `${entry.peerId}:${entry.lamportClock}`;
-      if (!seen.has(key)) {
-        this._reputationLedger.push(entry);
-        seen.add(key);
-        // Update lamport clock if entry is newer
-        if (entry.lamportClock >= this._lamportClock) {
-          this._lamportClock = entry.lamportClock + 1;
-        }
-      }
+      this.network.updateReputation(entry.peerId, entry.delta, entry.reason);
+      if (entry.lamportClock > this._lamportClock) this._lamportClock = entry.lamportClock + 1;
     }
   }
 }

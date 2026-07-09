@@ -1,16 +1,16 @@
 /**
  * network.js — the DAM/AXE-equivalent transport + routing layer.
  *
- * Preference: plain WebSockets + flood-fill gossip, not a DHT-style
- * routing overlay. AXE exists to avoid broadcasting every write to
- * every peer once a mesh has hundreds of nodes; building a correct
- * DHT is a substantial project on its own and only pays off at a scale
- * this composite doesn't target. Flood-fill (relay every new message to
- * every connected peer except the one it came from, deduped by message
- * id) is trivially correct and easy to audit — the tradeoff, stated
- * plainly: O(peers) traffic per write instead of O(log peers). Fine for
- * small-to-medium meshes (tens of peers); not a scale-to-thousands
- * design.
+ * Health-aware DHT routing over connected peers, enabled by default
+ * (dhtEnabled: true). Each message is routed to the K healthiest
+ * connected peers whose geohash bucket (first hex chars of the soul)
+ * matches the message's routing prefix, plus L adjacent peers for mesh
+ * healing. When too few peers match a bucket, routing falls back to
+ * flood-fill broadcast to all connected peers, so delivery never
+ * silently drops to zero. Peer health and reputation are tracked from
+ * real socket activity (open, latency, observed bad behavior), so the
+ * throttle gate is live without external callers. Set dhtEnabled:false
+ * for pure flood-fill.
  *
  * Isomorphic: uses the global WebSocket in browsers, and the `ws`
  * package in Node (peer dependency — see package.json).
@@ -46,6 +46,8 @@ class Network {
     this.writeRateScale = 1.0; // adaptive backpressure: scale factor for batch size
     this.dhtTable = []; // append-only routing table for multi-level DHT
     this.peerHealthScores = new Map(); // peerId -> {latency, loss, lastSeen}
+    this.peerRoutingKeys = new Map(); // peerKey -> routing prefix (learned), unknown = include all
+    this.dialedUrls = new Set(this.opts.peers || []); // urls we dialed (vs server-attached)
     this.reputationLedger = []; // append-only: {peerId, delta, reason, ts}
     this.reputationCache = new Map(); // peerId -> total reputation sum (sum of all deltas)
     this.messageQueue = []; // messages queued from throttled peers
@@ -96,16 +98,26 @@ class Network {
   _dial(url) {
     const WS = isNode ? require('ws') : WebSocket;
     const ws = new WS(url);
-    ws.addEventListener ? ws.addEventListener('open', () => {}) : null;
+    ws._dialUrl = url;
     this._attach(ws);
   }
 
   _attach(ws) {
     this.sockets.add(ws);
     this.metrics.peersConnected = this.sockets.size;
+    // Register the peer in the health map immediately so DHT routing sees
+    // real connected peers by default (no external caller required).
+    const peerKey = this._getPeerKey(ws);
+    this.updatePeerHealth(peerKey, 0, 0);
+    const handleOpen = () => { this.updatePeerHealth(this._getPeerKey(ws), 0, 0); };
     const handleClose = () => {
       this.sockets.delete(ws);
       this.metrics.peersConnected = this.sockets.size;
+      // Self-heal: redial only sockets we initiated (not server-attached).
+      if (ws._dialUrl && !ws._redialScheduled) {
+        ws._redialScheduled = true;
+        setTimeout(() => this._dial(ws._dialUrl), 2000);
+      }
     };
     const handleMessage = (raw) => {
       const recvStart = Date.now() + Math.random() / 1000;
@@ -113,13 +125,15 @@ class Network {
       try {
         msg = JSON.parse(typeof raw === 'string' ? raw : raw.data ?? raw.toString());
       } catch {
-        return; // malformed frame, drop silently
+        this.updateReputation(this._getPeerKey(ws), this.REP_DELTA_MALFORMED, 'malformed');
+        return; // malformed frame, drop and penalize sender
       }
       if (!msg.id || !this._remember(msg.id)) return; // already seen, stop the flood here
       // Signature verification: keypear-derived sender authenticity
       if (msg.sender && msg.signature && !this._verifySignature(msg.sender, msg, msg.signature)) {
         this.metrics.signatureDropped = (this.metrics.signatureDropped || 0) + 1;
-        return; // signature failed, drop silently
+        this.updateReputation(msg.sender, this.REP_DELTA_BYZANTINE, 'byzantine');
+        return; // signature failed, drop and penalize sender
       }
       // Lamport clock gate: reject out-of-order or rollback clocks
       if (msg.lamportClock !== undefined) {
@@ -128,6 +142,7 @@ class Network {
         const prior = lastClock.get(peerId) || 0;
         if (msg.lamportClock <= prior) {
           this.metrics.clockDropped = (this.metrics.clockDropped || 0) + 1;
+          this.updateReputation(peerId, this.REP_DELTA_REPLAY, 'replay');
           return; // clock did not advance, possible replay/rollback
         }
         lastClock.set(peerId, msg.lamportClock);
@@ -135,7 +150,8 @@ class Network {
       // PoW verification: if message includes PoW, verify before relaying
       if (msg.pow && !this._verifyPoW(msg.soul, msg.pow)) {
         this.metrics.powDropped = (this.metrics.powDropped || 0) + 1;
-        return; // PoW failed, drop silently
+        this.updateReputation(msg.sender || 'unknown', this.REP_DELTA_BYZANTINE, 'byzantine');
+        return; // PoW failed, drop and penalize sender
       }
       // Reputation gossip: update cache if message includes reputation data
       if (msg.reputationLedger && Array.isArray(msg.reputationLedger)) {
@@ -161,15 +177,18 @@ class Network {
       this.metrics.messagesReceived++;
       const recvMs = Date.now() + Math.random() / 1000 - recvStart;
       this._recordLatency('receive_ms', recvMs);
+      this.updatePeerHealth(this._getPeerKey(ws), recvMs, 0);
       this.onMessage(msg);
       this._relay(msg, ws); // flood to every other connected peer
     };
 
     if (isNode) {
+      ws.on('open', handleOpen);
       ws.on('close', handleClose);
       ws.on('message', handleMessage);
       ws.on('error', handleClose);
     } else {
+      ws.addEventListener('open', handleOpen);
       ws.addEventListener('close', handleClose);
       ws.addEventListener('message', handleMessage);
       ws.addEventListener('error', handleClose);
@@ -201,7 +220,7 @@ class Network {
       delete msgCopy.id;
       delete msgCopy.sender;
       delete msgCopy.signature;
-      const msgBody = JSON.stringify(msgCopy);
+      const msgBody = JSON.stringify(msgCopy, Object.keys(msgCopy).sort());
       const sigBuf = Buffer.from(signature, 'hex');
       return sodium.crypto_sign_verify_detached(sigBuf, Buffer.from(msgBody), publicKeyBuf);
     } catch (e) {
@@ -220,11 +239,15 @@ class Network {
   }
 
   _getPrefixMatches(soul, peers) {
-    // Extract prefix from soul: first 4 hex chars = 16 bits
-    if (!this._isKeychainDerived(soul)) return peers; // fallback: flood-fill
-    const soulPrefix = soul.substring(0, 4);
-    // Return only peers whose peerId matches the prefix (if available)
-    return peers; // TODO: implement peer ID tracking for prefix-based routing
+    // Bucket peers by the soul's geohash routing prefix. For a keychain-derived
+    // soul (64-hex public key) the prefix is its first DHT_GEOHASH_LENGTH chars.
+    if (!this._isKeychainDerived(soul)) return peers; // non-keychain soul: flood-fill
+    const soulPrefix = this._computeGeohash(soul);
+    return peers.filter(pk => {
+      const rk = this.peerRoutingKeys.get(pk);
+      if (rk === undefined) return true; // unknown peer: include (no routing key recorded)
+      return rk.startsWith(soulPrefix);
+    });
   }
 
   _updateBackpressure() {
@@ -280,59 +303,49 @@ class Network {
   }
 
   _selectRoutingPeers(msg) {
-    // DHT-aware peer selection: route to K nearest peers by geohash bucket
-    // Fallback to broadcast if K peers unavailable
-    const K = this.opts.dhtK || 3; // number of nearest peers per bucket
-    const L = this.opts.dhtL || 2; // adjacent buckets to gossip to
-    const selectedPeers = new Set();
+    // Health-aware DHT selection over CONNECTED peers (peerHealthScores is
+    // auto-populated from real socket activity, so this returns live peers by
+    // default). Route to K healthiest peers in the soul's geohash bucket, plus
+    // L adjacent peers for healing; fall back to flood-fill when too few match.
+    const K = this.DHT_K;
+    const L = this.DHT_L;
+    const selected = new Set();
 
-    // If DHT disabled, broadcast to all connected peers
+    // DHT disabled: pure flood-fill to all connected peers.
     if (this.opts.dhtEnabled === false) {
-      for (const ws of this.sockets) {
-        selectedPeers.add(this._getPeerKey(ws));
-      }
-      // Also include peers from health scores if no active sockets
-      if (selectedPeers.size === 0) {
-        for (const peerId of this.peerHealthScores.keys()) {
-          selectedPeers.add(peerId);
-        }
-      }
-      return selectedPeers;
+      for (const ws of this.sockets) selected.add(this._getPeerKey(ws));
+      return selected;
     }
 
     const soul = msg.soul || msg.id;
-    if (!soul) {
-      return new Set(Array.from(this.sockets).map(ws => this._getPeerKey(ws)));
+    const connected = Array.from(this.sockets).map(ws => this._getPeerKey(ws));
+    if (!soul || connected.length === 0) {
+      for (const pk of connected) selected.add(pk);
+      return selected;
     }
 
-    // Compute geohash prefix (simplified: use first 4 chars of soul hex hash)
-    const geohashPrefix = this._computeGeohash(soul);
+    // Rank connected peers by health (lower latency/less loss = better).
+    const ranked = connected
+      .map(pk => ({ pk, health: this.peerHealthScores.get(pk) || { latency: this.opts.maxLatency || 500, loss: 0 } }))
+      .sort((a, b) => (a.health.latency - 100 * a.health.loss) - (b.health.latency - 100 * b.health.loss));
 
-    // Find K healthiest peers in this bucket
-    const healthyPeers = this.getHealthyPeers();
-    const bucketed = healthyPeers.filter(p => {
-      const health = this.peerHealthScores.get(p);
-      return health && health.latency < (this.opts.maxLatency || 500) && health.loss < 0.1;
-    });
+    // Prefer peers whose routing bucket matches the soul's geohash prefix.
+    const bucketedKeys = this._getPrefixMatches(soul, ranked.map(e => e.pk));
+    const useBucket = bucketedKeys.length >= Math.ceil(K / 2);
+    const candidateKeys = useBucket ? bucketedKeys : ranked.map(e => e.pk);
 
-    // Add K nearest
-    for (let i = 0; i < Math.min(K, bucketed.length); i++) {
-      selectedPeers.add(bucketed[i]);
+    const rankedCandidates = candidateKeys
+      .map(pk => ranked.find(e => e.pk === pk))
+      .filter(Boolean);
+
+    for (let i = 0; i < Math.min(K, rankedCandidates.length); i++) selected.add(rankedCandidates[i].pk);
+    for (let i = 0; i < L && (K + i) < ranked.length; i++) selected.add(ranked[K + i].pk);
+
+    // Flood-fill fallback if bucket yield was too thin.
+    if (selected.size < Math.ceil(K / 2)) {
+      for (const pk of connected) selected.add(pk);
     }
-
-    // Add L adjacent buckets for healing
-    for (let i = 0; i < L && healthyPeers.length > K + i; i++) {
-      selectedPeers.add(healthyPeers[K + i]);
-    }
-
-    // Fallback: if K peers < threshold, broadcast to all
-    if (selectedPeers.size < K / 2) {
-      for (const peerId of this.peerHealthScores.keys()) {
-        selectedPeers.add(peerId);
-      }
-    }
-
-    return selectedPeers;
+    return selected;
   }
 
   _computeGeohash(soul) {

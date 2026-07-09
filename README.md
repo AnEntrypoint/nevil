@@ -23,7 +23,7 @@ primitives — native bindings in Node, WASM/JS in the browser).
 | **Identity/addressing** | `src/keychain.js` | keypear-style deterministic Ed25519 derivation |
 | Crypto | `src/crypto.js` | Web Crypto API — passphrase wrapping, encrypt-for-recipient |
 | Storage | `src/storage.js` | append-only log (Node `fs` / browser IndexedDB) |
-| Networking | `src/network.js` | WebSocket + flood-fill gossip |
+| Networking | `src/network.js` | WebSocket + DHT-aware bounded-subset routing + reputation ledger |
 | **Query** | `src/query.js` | GraphQL-shaped nested selection queries |
 | Composite | `nevil.js` | wires everything above into one API |
 
@@ -105,11 +105,17 @@ aliasing), `via` names the field holding the reference(s), and
 
 - **Storage — append-only log, not a radix tree.** Simpler, trivially
   crash-safe (a torn last line from a crash is just dropped on replay),
-  and the whole graph rebuilds in one O(n) pass on boot.
-- **Networking — WebSockets + flood-fill gossip, not a DHT.** Correct
-  and auditable at the cost of O(peers) traffic per write instead of
-  O(log peers) — stated plainly as a small-to-medium mesh design (tens
-  of peers), not a scale-to-thousands one.
+  and the whole graph rebuilds in one O(n) pass on boot. An optional
+  in-memory B-tree index overlay (`enableSoulIndex`) gives O(log n)-ish
+  prefix/range lookups after load.
+- **Networking — WebSockets + DHT-aware bounded-subset routing.** Each
+  write for a keychain-derived soul routes to a bounded subset (K
+  healthiest + L adjacent connected peers in that soul's geohash bucket)
+  instead of flooding every peer — reducing O(peers) flood-fill traffic
+  toward O(K). Falls back to flood-fill broadcast when fewer than K/2
+  connected peers match. This is a bounded-subset routing, not a
+  provably O(log peers)-hop DHT, and is a small-to-medium mesh design
+  (tens of peers), not a scale-to-thousands one.
 - **HAM conflict resolution — kept.** Genuinely a good fit for a
   leaderless graph CRDT; no principled reason to replace it.
 
@@ -228,7 +234,7 @@ npm install
 
 ## Design Choices (intentional trade-offs)
 
-- **Flood-fill gossip over DHT.** Network traffic scales with peer count (O(peers)), not diameter (O(log peers)). Correct choice for small-to-medium mesh (tens of peers, supervised environments). Thousands+ of peers require hierarchical routing or DHT; explicitly out-of-scope.
+- **DHT-aware bounded-subset routing over full flood-fill.** Network traffic for keychain-derived souls routes to a bounded subset (K healthiest + L adjacent connected peers in the soul's geohash bucket) rather than every peer — reducing O(peers) flood-fill traffic toward O(K) — with flood-fill fallback when too few peers match. This is a bounded-subset routing, not a provably O(log peers)-hop DHT. Correct choice for small-to-medium mesh (tens of peers, supervised environments); thousands+ of peers still need further hierarchical partitioning.
 - **Per-field eventual consistency over atomic multi-field commits.** Each field write signs independently with its own timestamp. A node with multi-field writes across time will hold fields from different points in time, each independently valid and verifiable. Fits append-only semantics; users requiring atomic multi-field should batch writes to a single .putAt() call.
 - **No rate limiting.** Spam resistance via proof-of-work (PoW) omitted; orthogonal to the graph and query layer. Can be added as an optional transport-layer policy without breaking the core API.
 - **Append-only log over radix tree.** Simpler, trivially crash-safe (torn last line dropped on replay). Entire graph rebuilds in O(n) on boot; cost acceptable for <10M nodes.
@@ -241,7 +247,7 @@ npm install
 
 System degrades gracefully under partial failure without explicit load-dependent knobs:
 
-- **Peer disconnect:** Local writes queue in the graph and persist to disk immediately (append-only + synchronous Graph.put). When the peer reconnects, the local replica syncs via flood-fill. No writes are lost.
+- **Peer disconnect:** Local writes queue in the graph and persist to disk immediately (append-only + synchronous Graph.put). When the peer reconnects, the local replica syncs via the DHT-aware routing layer (flood-fill fallback). No writes are lost.
 - **Network partition:** Each partition remains consistent locally (HAM deterministic), then reconverges when partition heals (last-write-wins with timestamps). No blocking consensus required.
 - **Storage I/O stall:** Graph operations are in-memory; storage persists asynchronously. A slow disk does not block graph mutations or network relay.
 - **Query on sparse graph:** Missing references return `null` (not errors); queries never crash on absent data, they simply don't resolve that branch.
@@ -250,15 +256,15 @@ These properties fall directly out of the append-only, eventual-consistency desi
 
 ## Future Optimizations (Implementation-Ready)
 
-The following extensions are designed but not yet implemented. Each is minimal, reuses existing architecture, and carries zero breaking changes:
+The following extensions build on the already-implemented bounded-subset routing and B-tree index. Each is minimal, reuses existing architecture, and carries zero breaking changes:
 
 ### 1. Hierarchical Prefixing (Scaling beyond tens of peers)
 
-Route writes by soul prefix instead of flooding to all peers. Keychain-derived souls (hex Ed25519 keys) encode natural affinity; writes route only to peers matching the soul's prefix bits. Falls back to flood-fill for plain souls.
+A DHT-aware bounded-subset routing is already on by default (routes keychain-derived souls to a bounded subset of K healthiest + L adjacent connected peers in the soul's geohash bucket, with flood-fill fallback). This extension deepens prefix matching and adds further levels of partitioning for larger meshes.
 
-**Baseline (flood-fill):** O(peers) traffic per write
-**With prefixing:** O(log peers) for keychain-derived souls on large meshes
-**Implementation:** Add `routeByPrefix(soul)` in network.js; measure via `getMetrics()` with 20+ peer load test.
+**Baseline (full flood-fill):** O(peers) traffic per write
+**Current bounded-subset:** O(K) traffic per write for keychain-derived souls (not a provably O(log peers)-hop DHT)
+**Implementation:** Extend `_selectRoutingPeers(soul)` partitioning in network.js; measure via `getMetrics()` with 20+ peer load test.
 
 ### 2. Adaptive Backpressure (p99 Latency Bounds)
 
@@ -290,8 +296,8 @@ Reduce write-rate when p99 latency exceeds target. Scale is graceful degrade, no
 Peers derive "routing keys" deterministically via keypear: `routingKey = keychain.sub('routing').sub(soulPrefix).head.publicKey`. On connect, peers broadcast their routing key. Writes route only to peers matching the soul's routing prefix. Forward-only keypear property eliminates key-exchange protocol.
 
 **Baseline:** O(peers) messages per write (flood-fill)
-**With routing:** O(log peers) for keychain-derived souls on large meshes
-**Implementation:** `keychain.getRoutingKey(soulPrefix)` already added; integrate into `network.js` peer registry.
+**Current bounded-subset routing:** O(K) messages per write for keychain-derived souls (not a provably O(log peers)-hop DHT)
+**Implementation:** `keychain.getRoutingKey(soulPrefix)` added; bounded-subset routing integrated into `network.js` peer registry via `_selectRoutingPeers`.
 
 ### 5. Deterministic Batch Commits (Atomic Multi-Field Writes)
 
@@ -317,44 +323,40 @@ Each write includes `{msg, pow: {nonce, difficulty}}` where nonce satisfies `lea
 
 ## Implemented Solutions (Previously Out-of-Scope)
 
-Three limitations have been reclassified as in-scope and fully implemented:
+Three limitations have been reclassified as in-scope and fully implemented. Note the honest scope: DHT-aware routing is a bounded-subset (K-peer) routing, NOT a multi-level O(log peers)-hop DHT, and Lamport clocks provide per-field causal ordering (not cross-batch ACID transactions):
 
-### 1. Multi-Level DHT for Millions to Trillions of Peers
+### 1. DHT-Aware Bounded-Subset Routing
 
-**Problem:** Hierarchical routing above scales to millions (O(log peers)). Beyond requires additional layers.
+**Problem:** Flood-fill gossip sends every write to every peer (O(peers) traffic), which does not scale past tens of peers.
 
-**Solution:** Multi-level DHT via geohash space partitioning:
-- **L1 routing:** Regional clusters by geohash prefix (first 4 hex chars of soul)
-- **L2 routing:** Within-region affinity via keypear-derived routing keys (`keychain.sub('routing').sub(prefix)`)
-- **L3 routing:** Peer health scores (latency-based affinity, loss rate tracking)
-- **Fallback:** Flood-fill on timeout (graceful degrade)
+**Solution:** DHT-aware bounded-subset routing via geohash bucketing, enabled by default:
+- **Geohash bucketing:** Souls bucketed by geohash prefix derived from the keypair
+- **Bounded subset:** Route to K healthiest + L adjacent *connected* peers in the matching bucket
+- **Peer health:** Latency-based affinity, auto-populated from real socket send/recv latency
+- **Fallback:** Flood-fill broadcast when fewer than K/2 connected peers match (graceful degrade)
 
-**Implementation:** `network.addDHTEntry()`, `network.getDHTMatches()`, `network.updatePeerHealth()`, `network.getHealthyPeers()`. Append-only routing table (no rebalancing). Zero-knowledge routing proofs prevent sybil attacks.
+**Implementation:** `network._selectRoutingPeers()`, `network._computeGeohash()`, `network.updatePeerHealth()`, `network.getHealthyPeers()`. Reconnects on socket close. This reduces O(peers) flood-fill toward O(K) — it is NOT a provably O(log peers)-hop DHT, and further hierarchical levels (millions+ peers) remain future work.
 
-**Scaling:** Tested at 100+ peer simulation. Recursive lookup: L1 → L2 within region → L3 latency-based. No consensus required (forward-only keypear derivation).
+### 2. Per-Field Causal Ordering via Lamport Clocks
 
-### 2. Cross-Batch ACID via Lamport Clocks
+**Problem:** Eventual consistency can appear to "go backwards" (causally dependent writes arrive out-of-order).
 
-**Problem:** Deterministic batch commits provide single-batch atomicity. Cross-batch coordination needs consensus.
+**Solution:** Global Lamport clock for deterministic per-field ordering without coordinator:
+- **Global clock:** `_lamportClock` field in Nevil instance, advanced on every local write
+- **Ordering:** HAM conflict resolution order is `lamportClock > wall-clock ts > canonical-value tie-break`
+- **Tie-breaking:** Lamport clock ordering gives deterministic convergence on concurrent equal-timestamp writes
 
-**Solution:** Global Lamport clock for deterministic ordering without coordinator:
-- **Global clock:** `_lamportClock` field in Nevil instance, incremented on each `batchWrite()`
-- **Batch metadata:** Each batch includes `_lamportClock` value in its fields
-- **Multi-user coordination:** First signer becomes batch owner; subsequent writes await batch clock
-- **Tie-breaking:** Lamport clock ordering + keypear `txnId` for deterministic lexicographic resolution
-- **Replay:** Query `['txn', txnId]` returns all writes in clock order
+**Implementation:** nevil advances `_lamportClock` on each write and threads the remote message's clock through `graph.mergeNode`. No coordinator needed.
 
-**Implementation:** `batchWrite()` increments `_lamportClock` before persisting. HAM conflict resolution + Lamport clock ensure same field value on all peers. No coordinator needed.
-
-**Guarantee:** Deterministic ordering across batches and users. Partial failure resilient (append-only log survives crashes). Eventual consistency with deterministic tie-break.
+**Guarantee:** Causal ordering of field writes across peers; deterministic tie-break. (This is per-field causal ordering, not cross-batch ACID transactions — batch atomicity is a separate, not-yet-implemented feature.)
 
 ### 3. Decentralized Reputation Ledger (Byzantine-Resistant Throttling)
 
 **Problem:** Centralized rate limiting requires external infrastructure. Byzantine peers can spam.
 
-**Solution:** Append-only reputation ledger with gossip-based convergence and throttle gating:
+**Solution:** Single live append-only reputation ledger with gossip-based convergence and in-flow throttle gating:
 - **Append-only ledger:** `reputationLedger` array of `{peerId, delta, reason, timestamp}` entries
-- **Delta rules:** +1 (good), -1 (malformed), -5 (replay), -3 (Byzantine), +10 (routing-help)
+- **Delta rules:** auto-recorded on in-flow drop — malformed→malformed, bad signature→byzantine, clock rollback/replay→replay, PoW fail→byzantine
 - **Reputation sum:** `getReputation(peerId)` = sum of all deltas for that peer
 - **Throttle states:** accept (rep >= 0), queue ([-10, 0)), drop (rep < -10)
 - **Byzantine isolation:** `isByzantineIsolated(peerId, threshold)` isolates low-rep peers
@@ -402,36 +404,36 @@ PKI without PKI infrastructure. Addresses = public keys. Verification = Ed25519 
 
 All four prior limitations have been reclassified as in-scope and fully implemented:
 
-### 1. **O(peers) Traffic → O(log peers) via DHT** (Transcendence 1)
+### 1. **O(peers) Traffic → bounded-subset O(K) via DHT-aware routing** (Transcendence 1)
 **Problem:** Flood-fill gossip scales as O(peers) per write — good for small meshes (tens), not for large ones.
 
-**Solution:** Hierarchical DHT routing via geohash bucketing. Souls are bucketed by prefix (4-char geohash derived from keypair), peers deterministically route to K-nearest peers in matching buckets plus L adjacent buckets. Fallback to broadcast on unavailability (graceful degrade).
+**Solution:** DHT-aware bounded-subset routing via geohash bucketing, enabled by default. Souls are bucketed by geohash prefix derived from the keypair; the routing layer selects K healthiest + L adjacent *connected* peers in the matching bucket and relays one hop to them. Falls back to flood-fill broadcast when fewer than K/2 connected peers match. This reduces O(peers) flood-fill traffic toward O(K) — it is NOT a provably O(log peers)-hop DHT; each routed message still makes one relay hop to the K selected peers.
 
-**Implementation:** `network.js` adds `_selectRoutingPeers()`, `_computeGeohash()`, `updatePeerHealth()`, `getHealthyPeers()`. All routing deterministic (no coordinator). Witness: `tools/witness-dht-routing.js` validates geohash consistency, peer selection, health scoring (6 tests).
+**Implementation:** `network.js` `_selectRoutingPeers()` selects from CONNECTED sockets; peer health is auto-populated from real socket send/recv latency; `_computeGeohash()` buckets by soul; reconnects on socket close. Witness: `tools/witness-dht-routing.js` asserts real A→B delivery via the routing layer.
 
 ### 2. **Eventual Consistency → Optional Causal Consistency** (Transcendence 2)
 **Problem:** Eventual consistency can appear to "go backwards" (causally dependent writes arrive out-of-order).
 
-**Solution:** Global Lamport clocks for causal consistency without consensus. Each peer increments `localClock` on every write; messages carry clock; receivers max(incoming clock, localClock) + 1. HAM applies per-field conflict resolution, clock determines order. Deterministic, no coordinator.
+**Solution:** Global Lamport clocks for causal consistency without consensus, now actually used. HAM conflict resolution order is `lamportClock > wall-clock ts > canonical-value tie-break`. nevil auto-advances its global `_lamportClock` on every local write and passes the remote message's `lamportClock` into `graph.mergeNode` on apply. Deterministic, no coordinator.
 
-**Implementation:** `graph.js` adds `localClock` counter, `mergeNode()` accepts external `lamportClock`. `network.js` carries `lamportClock` in broadcasts. Witness: `tools/witness-lamport-clocks.js` validates clock ordering, partition reconvergence (4 tests).
+**Implementation:** `graph.js` `localClock` counter and `mergeNode()` ordering; `nevil.js` advances `_lamportClock` per write and threads the remote clock through apply. Witness: `tools/witness-lamport-clocks.js` asserts two graphs converge on the higher clock and concurrent equal-timestamp reference writes converge deterministically.
 
 ### 3. **No Rate-Limiting → Reputation-Based Throttling** (Transcendence 3)
 **Problem:** Centralized rate-limiting requires external infrastructure. Byzantine peers can spam.
 
-**Solution:** Append-only reputation ledger with peer-to-peer gossip. Each peer tracks `{peerId, delta, reason, timestamp}` entries. Delta rules: +1 good, -1 malformed, -5 replay, -3 byzantine, +10 routing help. Throttle states: accept (rep >= 0), queue ([-10, 0)), drop (rep < -10). No central authority; reputation converges via gossip.
+**Solution:** Single live append-only reputation ledger with peer-to-peer gossip. `network` auto-records a reputation delta when it drops a message (malformed→malformed, bad signature→byzantine, clock rollback/replay→replay, PoW fail→byzantine); nevil gossips `network.reputationLedger` with each write. The accept/queue/drop throttle gate operates in the real message flow. No central authority.
 
-**Implementation:** `network.js` adds `reputationLedger`, `updateReputation()`, `getReputation()`, `getThrottleState()`, `isByzantineIsolated()`. Message handler checks throttle before processing. Witness: `tools/witness-reputation-ledger.js` validates append-only semantics, delta rules, throttle gating (6 tests).
+**Implementation:** `network.js` `reputationLedger`, `updateReputation()`, `getReputation()`, `getThrottleState()`, `isByzantineIsolated()`. Message handler drops in-flow on malformed/bad-signature/replay/PoW and auto-penalizes. Witness: `tools/witness-reputation-ledger.js` asserts a bad-signature message is dropped in-flow AND auto-penalizes the sender's reputation.
 
-### 4. **O(n) Startup → O(log n) via B-tree** (Transcendence 4)
-**Problem:** Append-only log requires full replay (O(n)) on boot. Slow for large graphs.
+### 4. **O(n) Boot → O(log n)-ish index lookups via B-tree** (Transcendence 4)
+**Problem:** Append-only log requires full replay (O(n)) on boot. Slow lookups over a large in-memory graph without an index.
 
-**Solution:** Hybrid memtable + SSTable architecture (LSM tree). Memtable (in-memory) accepts fast writes; periodically flushes to immutable SSTables (sorted, indexed). Range queries via binary search. Compaction merges old SSTables, deduplicates by clock. Journal replay on boot rebuilds state.
+**Solution:** `BTreeIndex` wired as the real `Storage` index (when `enableSoulIndex`/`enableIndex` is set) for `prefixMatch`/`rangeScan`/`get`/`add`/`rebuild`. `get` binary-searches SSTable ranges (no longer a linear scan), giving O(log n)-ish prefix/range lookups after load. The index is in-memory and rebuilt on boot by replaying the append-only log, so **startup is O(n), not O(log n)**.
 
-**Implementation:** `storage-btree.js` implements `BTreeIndex` with `write()`, `get()`, `rangeScan()`, `prefixScan()`, `flushMemtable()`, `compactSSTables()`. Startup: load latest SSTable index + replay journal (< 100ms for 10k entries). Witness: `tools/witness-btree-storage.js` validates memtable/SSTable ops, range scanning, compaction (10 tests).
+**Implementation:** `storage-btree.js` implements `BTreeIndex` with `write()`, `get()`, `rangeScan()`, `prefixScan()`, `flushMemtable()`, `compactSSTables()`, wired into `storage.js`. Witness: `tools/witness-btree-storage.js` uses real `Storage` and asserts the index contract (real prefix/range lookups, binary-search `get`).
 
 ### All Four Together (Transcendence Integration)
-Full-system test: `tools/witness-integration.js` validates DHT + Lamport + Reputation + B-tree working in concert without interference (7 major scenarios).
+Full-system test: `tools/witness-integration.js` asserts `A.putAt(...)` gossips to B and `B.getAtVerified(...)` returns the verified title/_owner/_path, plus prefix scan — proving cross-node signed writes deliver AND verify with canonical-JSON signing + auto-advanced clock.
 
 ## CAP Theorem Modes (AP/CA/CP)
 
