@@ -1,1 +1,0 @@
-apply all our policies and preferences and make this as familiar to sqlite or graphql users as we can get it
