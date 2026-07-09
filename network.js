@@ -44,6 +44,9 @@ class Network {
     this.latencies = { send_ms: [], receive_ms: [] }; // ring buffers for latency tracking
     this.maxLatencySamples = 1000; // keep last 1000 samples per operation
     this.writeRateScale = 1.0; // adaptive backpressure: scale factor for batch size
+    this.dhtTable = []; // append-only routing table for multi-level DHT
+    this.peerHealthScores = new Map(); // peerId -> {latency, loss, lastSeen}
+    this.reputationCache = new Map(); // peerId -> total reputation sum
 
     if (isNode && this.opts.server) this._startServer();
     for (const url of this.opts.peers || []) this._dial(url);
@@ -94,6 +97,13 @@ class Network {
       this.metrics.messagesReceived++;
       const recvMs = Date.now() + Math.random() / 1000 - recvStart;
       this._recordLatency('receive_ms', recvMs);
+      // Reputation gossip: update cache if message includes reputation data
+      if (msg.reputationLedger && Array.isArray(msg.reputationLedger)) {
+        for (const entry of msg.reputationLedger) {
+          const sum = this.reputationCache.get(entry.peerId) || 0;
+          this.reputationCache.set(entry.peerId, sum + entry.delta);
+        }
+      }
       this.onMessage(msg);
       this._relay(msg, ws); // flood to every other connected peer
     };
@@ -204,6 +214,51 @@ class Network {
         receive_ms: { p50: p50recv, p90: p90recv, p99: p99recv, samples: this.latencies.receive_ms.length }
       }
     };
+  }
+
+  /** Add DHT routing table entry (append-only): {geohashPrefix, peerId, latency, reputationMin}. */
+  addDHTEntry(geohashPrefix, peerId, latency, reputationMin = 0) {
+    const entry = { geohashPrefix, peerId, latency, reputationMin, timestamp: Date.now() };
+    this.dhtTable.push(entry);
+    return entry;
+  }
+
+  /** Get DHT entries matching soul prefix (L1-L2 lookup). */
+  getDHTMatches(soul, geohashPrefix) {
+    return this.dhtTable.filter(e =>
+      e.geohashPrefix === geohashPrefix ||
+      e.geohashPrefix === soul.substring(0, 4)
+    );
+  }
+
+  /** Update peer health score (latency + loss rate). */
+  updatePeerHealth(peerId, latency, loss = 0) {
+    const existing = this.peerHealthScores.get(peerId) || { latency: 0, loss: 0, count: 0 };
+    existing.latency = (existing.latency * existing.count + latency) / (existing.count + 1);
+    existing.loss = (existing.loss * existing.count + loss) / (existing.count + 1);
+    existing.count++;
+    existing.lastSeen = Date.now();
+    this.peerHealthScores.set(peerId, existing);
+  }
+
+  /** Get peers sorted by health (latency ascending, loss descending). */
+  getHealthyPeers() {
+    const peers = Array.from(this.peerHealthScores.entries());
+    return peers.sort((a, b) => {
+      const scoreA = a[1].latency - (100 * a[1].loss); // lower = better
+      const scoreB = b[1].latency - (100 * b[1].loss);
+      return scoreA - scoreB;
+    }).map(p => p[0]);
+  }
+
+  /** Update reputation cache (pull from gossip). */
+  updateReputationCache(peerId, reputation) {
+    this.reputationCache.set(peerId, reputation);
+  }
+
+  /** Get cached reputation for peer. */
+  getReputationCache(peerId) {
+    return this.reputationCache.get(peerId) || 0;
   }
 }
 

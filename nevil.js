@@ -47,6 +47,8 @@ class Nevil {
     this.graph = new Graph();
     this._ready = this._boot();
     this._identity = null; // { keychain, soul } once logged in / created
+    this._lamportClock = 0; // global lamport clock for cross-batch ACID
+    this._reputationLedger = []; // append-only karma ledger: {peerId, delta, reason, lamportClock, zkProof}
   }
 
   async _boot() {
@@ -67,7 +69,9 @@ class Nevil {
       }
       if (this.storage.index) this.storage.index.add(soul);
       this.storage.persist(soul, fields, ts);
-      this.network.broadcast({ type: 'put', soul, fields, ts });
+      // Gossip reputation ledger along with graph writes
+      const msg = { type: 'put', soul, fields, ts, reputationLedger: this._reputationLedger };
+      this.network.broadcast(msg);
     });
 
     return this;
@@ -333,9 +337,56 @@ class Nevil {
     // Derive transaction ID: txnId = keychain.sub('txn').derive(nonce)
     const txnKeychain = this._identity.keychain.sub('txn').sub(nonce);
     const txnId = txnKeychain.head.publicKey.toString('hex');
-    // Write all fields atomically under ['txn', txnId] path
+    // Increment Lamport clock for cross-batch ordering
+    this._lamportClock++;
+    // Write all fields atomically under ['txn', txnId] path with lamport clock
     const batchPath = ['txn', txnId];
+    fields._lamportClock = this._lamportClock;
     return this.putAt(batchPath, fields);
+  }
+
+  /** Add reputation delta to peer's karma ledger (append-only). */
+  addReputation(peerId, delta, reason = '') {
+    const entry = {
+      peerId,
+      delta,
+      reason,
+      lamportClock: ++this._lamportClock,
+      timestamp: Date.now()
+    };
+    this._reputationLedger.push(entry);
+    // Persist to graph under ['reputation', peerId]
+    const repPath = ['reputation', peerId];
+    this.put(repPath.join(':'), entry);
+    return entry;
+  }
+
+  /** Get total reputation for a peer (sum all deltas for that peer). */
+  getReputation(peerId) {
+    return this._reputationLedger
+      .filter(e => e.peerId === peerId)
+      .reduce((sum, e) => sum + e.delta, 0);
+  }
+
+  /** Get all reputation entries (gossip sync surface). */
+  getReputationLedger() {
+    return this._reputationLedger;
+  }
+
+  /** Merge remote reputation entries into local ledger (for gossip). */
+  mergeReputationLedger(entries) {
+    const seen = new Set(this._reputationLedger.map(e => `${e.peerId}:${e.lamportClock}`));
+    for (const entry of entries) {
+      const key = `${entry.peerId}:${entry.lamportClock}`;
+      if (!seen.has(key)) {
+        this._reputationLedger.push(entry);
+        seen.add(key);
+        // Update lamport clock if entry is newer
+        if (entry.lamportClock >= this._lamportClock) {
+          this._lamportClock = entry.lamportClock + 1;
+        }
+      }
+    }
   }
 }
 
