@@ -89,6 +89,22 @@ class Network {
         return; // malformed frame, drop silently
       }
       if (!msg.id || !this._remember(msg.id)) return; // already seen, stop the flood here
+      // Signature verification: keypear-derived sender authenticity
+      if (msg.sender && msg.signature && !this._verifySignature(msg.sender, msg, msg.signature)) {
+        this.metrics.signatureDropped = (this.metrics.signatureDropped || 0) + 1;
+        return; // signature failed, drop silently
+      }
+      // Lamport clock gate: reject out-of-order or rollback clocks
+      if (msg.lamportClock !== undefined) {
+        const peerId = msg.sender || 'unknown';
+        const lastClock = this.peerClocks = this.peerClocks || new Map();
+        const prior = lastClock.get(peerId) || 0;
+        if (msg.lamportClock <= prior) {
+          this.metrics.clockDropped = (this.metrics.clockDropped || 0) + 1;
+          return; // clock did not advance, possible replay/rollback
+        }
+        lastClock.set(peerId, msg.lamportClock);
+      }
       // PoW verification: if message includes PoW, verify before relaying
       if (msg.pow && !this._verifyPoW(msg.soul, msg.pow)) {
         this.metrics.powDropped = (this.metrics.powDropped || 0) + 1;
@@ -130,6 +146,26 @@ class Network {
   _isKeychainDerived(soul) {
     // Check if soul looks like a hex Ed25519 public key (64 hex chars)
     return /^[0-9a-f]{64}$/.test(soul);
+  }
+
+  _verifySignature(sender, msg, signature) {
+    // Verify message signature: sender is keypear-derived soul (public key hex)
+    // Signature covers: {soul, fields, ts, lamportClock, ...} (everything except id, sender, signature)
+    if (!sender || !signature || typeof signature !== 'string') return false;
+    try {
+      const sodium = require('sodium-universal');
+      const publicKeyHex = sender;
+      const publicKeyBuf = Buffer.from(publicKeyHex, 'hex');
+      const msgCopy = { ...msg };
+      delete msgCopy.id;
+      delete msgCopy.sender;
+      delete msgCopy.signature;
+      const msgBody = JSON.stringify(msgCopy);
+      const sigBuf = Buffer.from(signature, 'hex');
+      return sodium.crypto_sign_verify_detached(sigBuf, Buffer.from(msgBody), publicKeyBuf);
+    } catch (e) {
+      return false;
+    }
   }
 
   _verifyPoW(soul, pow) {

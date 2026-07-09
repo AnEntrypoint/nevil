@@ -9,6 +9,19 @@ const fs = require('fs');
 const path = require('path');
 const Nevil = require('../nevil');
 
+let messageIndex = 0;
+
+function recordMessage(msg, senderIdx) {
+  const logFile = './chaos-messages.ndjson';
+  const entry = {
+    ...msg,
+    _index: messageIndex++,
+    _senderIdx: senderIdx,
+    _timestamp: Date.now()
+  };
+  fs.appendFileSync(logFile, JSON.stringify(entry) + '\n');
+}
+
 async function chaosReplay(opts = {}) {
   const { logFile = './chaos-messages.ndjson', dropRate = 0.1, jitterMs = 50, peersCount = 5 } = opts;
 
@@ -29,13 +42,19 @@ async function chaosReplay(opts = {}) {
 
   console.log(`Replaying ${messages.length} messages with drop=${(dropRate * 100).toFixed(0)}% jitter=${jitterMs}ms`);
 
-  // Spawn N peers
+  // Spawn N peers with message recording hooks
   const peers = [];
   for (let i = 0; i < peersCount; i++) {
     const dataDir = path.join('./chaos-replay-logs', `peer-${i}`);
     if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
     const peer = new Nevil({ file: path.join(dataDir, 'log.ndjson'), peers: [] });
     await peer.ready();
+    // Hook: record all broadcasts for deterministic replay
+    const origBroadcast = peer.network.broadcast.bind(peer.network);
+    peer.network.broadcast = (payload) => {
+      recordMessage(payload, i);
+      return origBroadcast(payload);
+    };
     peers.push(peer);
   }
 
@@ -91,13 +110,6 @@ async function chaosReplay(opts = {}) {
   }
 
   return results;
-}
-
-// Record helper: attach to any Nevil broadcast to log messages
-function recordMessage(msg, senderIdx) {
-  const logFile = './chaos-messages.ndjson';
-  const entry = { ...msg, _index: (msg._index || 0) + 1, _senderIdx: senderIdx, _timestamp: Date.now() };
-  fs.appendFileSync(logFile, JSON.stringify(entry) + '\n');
 }
 
 module.exports = { chaosReplay, recordMessage };

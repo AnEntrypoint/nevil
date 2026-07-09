@@ -70,7 +70,21 @@ class Nevil {
       if (this.storage.index) this.storage.index.add(soul);
       this.storage.persist(soul, fields, ts);
       // Gossip reputation ledger along with graph writes
-      const msg = { type: 'put', soul, fields, ts, reputationLedger: this._reputationLedger };
+      let msg = { type: 'put', soul, fields, ts, reputationLedger: this._reputationLedger, lamportClock: this._lamportClock };
+      // Byzantine resilience: attach sender (identity soul) + signature if identity is set
+      if (this._identity) {
+        msg.sender = this._identity.soul;
+        const msgCopy = { ...msg };
+        delete msgCopy.id;
+        delete msgCopy.sender;
+        delete msgCopy.signature;
+        const msgBody = JSON.stringify(msgCopy);
+        const keyPair = this._identity.keychain.get();
+        if (keyPair.writable) {
+          const sig = keyPair.sign(Buffer.from(msgBody));
+          msg.signature = sig.toString('hex');
+        }
+      }
       this.network.broadcast(msg);
     });
 

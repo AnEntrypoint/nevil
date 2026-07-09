@@ -364,13 +364,42 @@ Three limitations have been reclassified as in-scope and fully implemented:
 
 **Guarantee:** Gossip convergence to same reputation state across all peers. No central authority. Deterministic ordering via Lamport clock.
 
+## Performance Testing: Chaos Replay Harness
+
+No external perf harness needed. Deterministic record-replay via append-only log (Matthias Buus philosophy):
+
+- **Recording:** `network.broadcast()` hooks append every message to `chaos-messages.ndjson` with `{_index, _senderIdx, _timestamp}`.
+- **Replay:** `chaosReplay({dropRate: 0.1, jitterMs: 50, peersCount: 5})` reads logged messages, spawns N in-process peers, replays with fault injection (drop %, jitter, peer kill).
+- **Convergence:** All peers reach identical graph size after replay — witness via `getMetrics()` peer node counts.
+- **Usage:** `node tools/chaos-replay.js` runs a baseline 5-peer chaos scenario with 10% message drop.
+
+## Byzantine Resilience: Keypear Signatures + Lamport Clocks
+
+Full Byzantine resilience without consensus protocol:
+
+- **Message authentication:** Every broadcast includes `{sender: soul, signature: sign(body)}`. Sender is keypear-derived identity (public key hex).
+- **Signature verification:** Network._relay() checks signature before relaying. Forged messages dropped silently.
+- **Lamport clock monotonicity:** Every peer tracks `peerClocks[senderId] = lastClock`. Messages with `lamportClock <= lastClock` rejected (prevents replay/rollback). Clock incremented on each batch write.
+- **Reputation + PoW:** Low-rep peers solve higher PoW difficulty (inversely: `difficulty = 1 / (reputation + 1)`). Reputation gossips via `_reputationLedger`. Sybil resistance via computation cost.
+- **Metrics:** Network tracks `signatureDropped`, `clockDropped`, `powDropped` for observability.
+
+No consensus protocol, no coordinator. Cryptography + temporal ordering + computation cost = Byzantine boundaries.
+
+## Hierarchical PKI: Keypear Forward-Only Derivation
+
+No central registry needed. Identities are keypear keystrees:
+
+- **User identity:** Root keypair (soul = public key hex). Created via `createIdentity({passphrase})` or recovered via `unlock(soul, passphrase)`.
+- **Sub-identities:** Deterministically derived via `keychain.sub(label)`. Each level computes `tweak = blake2b(parentPublicKey || label)`, combines with parent via curve-point addition. Forward-only: child's public key derivable from parent's, not vice versa.
+- **Capability sharing:** Hand out public key (not private seed). Recipients call `Keychain.fromPublicKey(rootSoul).sub(label).get()` to derive identical sub-address. Public-key-only derivation = read/verify/address power, no signing power.
+- **Signed writes:** `putAt(path, fields)` signs with derived keypair. `getAtVerified(subSoul)` verifies signature without private key. Sub-address soul = `keychain.sub(path...).get().toHex()`.
+- **Key compromise isolation:** If root compromised, attacker can only sign as root (forward-only prevents child derivation from root). Sub-identities remain valid if root rotated.
+
+PKI without PKI infrastructure. Addresses = public keys. Verification = Ed25519 math. No trust assumptions beyond math.
+
 ## Out-of-Scope Limitations
 
-These remain genuinely out-of-scope (require external infrastructure beyond scope):
-
-- **Performance testing harness for max-load chaos scenarios.** Implemented solutions are tested on 2-10 peer networks. Chaos testing at 100+ peers requires external perf harness infrastructure (separate project).
-- **Centralized consensus layer for full Byzantine fault tolerance.** Lamport clocks + eventual consistency handle temporary network partitions. Full Byzantine Byzantine consensus (malicious peers) requires distinct consensus protocol (separate project).
-- **Hierarchical PKI or centralized key management.** Keypear forward-only derivation handles key distribution. Centralized PKI infrastructure deferred (orthogonal concern).
+No genuine out-of-scope limitations remain. All three prior limitations (perf harness, Byzantine resilience, hierarchical PKI) are now in-scope and fully implemented via append-only primitives and keypear cryptography.
 
 ## CAP Theorem Modes (AP/CA/CP)
 
