@@ -86,6 +86,11 @@ class Network {
         return; // malformed frame, drop silently
       }
       if (!msg.id || !this._remember(msg.id)) return; // already seen, stop the flood here
+      // PoW verification: if message includes PoW, verify before relaying
+      if (msg.pow && !this._verifyPoW(msg.soul, msg.pow)) {
+        this.metrics.powDropped = (this.metrics.powDropped || 0) + 1;
+        return; // PoW failed, drop silently
+      }
       this.metrics.messagesReceived++;
       const recvMs = Date.now() + Math.random() / 1000 - recvStart;
       this._recordLatency('receive_ms', recvMs);
@@ -115,6 +120,16 @@ class Network {
   _isKeychainDerived(soul) {
     // Check if soul looks like a hex Ed25519 public key (64 hex chars)
     return /^[0-9a-f]{64}$/.test(soul);
+  }
+
+  _verifyPoW(soul, pow) {
+    // Verify PoW: check that leading_zeros(sha256(soul || nonce)) >= difficulty
+    if (!pow || typeof pow.nonce !== 'number' || typeof pow.difficulty !== 'number') return false;
+    const crypto = require('crypto');
+    const input = soul + ':' + pow.nonce;
+    const hash = crypto.createHash('sha256').update(input).digest('hex');
+    const leadingZeros = hash.match(/^0*/)[0].length;
+    return leadingZeros >= pow.difficulty;
   }
 
   _getPrefixMatches(soul, peers) {

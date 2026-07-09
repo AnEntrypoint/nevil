@@ -325,6 +325,18 @@ class Nevil {
   get Keychain() {
     return Keychain;
   }
+
+  /** Batch write: atomically write multiple fields under a deterministically derived transaction ID. */
+  async batchWrite(fields, options = {}) {
+    if (!this._identity) throw new Error('batchWrite requires an identity (call createIdentity or unlock first)');
+    const { nonce = Math.random().toString(36).substring(7) } = options;
+    // Derive transaction ID: txnId = keychain.sub('txn').derive(nonce)
+    const txnKeychain = this._identity.keychain.sub('txn').sub(nonce);
+    const txnId = txnKeychain.head.publicKey.toString('hex');
+    // Write all fields atomically under ['txn', txnId] path
+    const batchPath = ['txn', txnId];
+    return this.putAt(batchPath, fields);
+  }
 }
 
 module.exports = Nevil;

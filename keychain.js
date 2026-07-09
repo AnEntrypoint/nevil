@@ -240,6 +240,13 @@ class Keychain {
   static composeChild(parentKeyPair, label) {
     return parentKeyPair.derive(label);
   }
+
+  /** Derive a routing key for DHT prefix-based routing from a soul prefix. */
+  getRoutingKey(soulPrefix) {
+    // routingKey = keychain.sub('routing').sub(soulPrefix).get()
+    // Deterministic derivation via keypear; forward-only (can't recover parent from child)
+    return this.sub('routing').sub(soulPrefix).head.publicKey.toString('hex').substring(0, 4);
+  }
 }
 
 module.exports = { Keychain, KeyPair };

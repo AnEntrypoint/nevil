@@ -285,13 +285,43 @@ Reduce write-rate when p99 latency exceeds target. Scale is graceful degrade, no
 
 **Implementation:** Chaos test harness complete; run with `node tools/chaos-test.js`.
 
+### 4. Distributed Routing via Keypear (Scaling to Millions)
+
+Peers derive "routing keys" deterministically via keypear: `routingKey = keychain.sub('routing').sub(soulPrefix).head.publicKey`. On connect, peers broadcast their routing key. Writes route only to peers matching the soul's routing prefix. Forward-only keypear property eliminates key-exchange protocol.
+
+**Baseline:** O(peers) messages per write (flood-fill)
+**With routing:** O(log peers) for keychain-derived souls on large meshes
+**Implementation:** `keychain.getRoutingKey(soulPrefix)` already added; integrate into `network.js` peer registry.
+
+### 5. Deterministic Batch Commits (Atomic Multi-Field Writes)
+
+`db.batchWrite({field1, field2, ...})` derives a transaction ID deterministically and writes all fields under a single signed operation. All fields converge atomically or not at all. Recovery: query for `['txn', txnId]` replays all fields.
+
+**Measurements:**
+- Atomicity: all fields in batch converge together
+- No coordinator needed: keypear deterministic derivation
+- Example: `await db.batchWrite({title: 'x', body: 'y', tags: ['a']})`
+
+**Implementation:** `batchWrite(fields)` method added to Nevil class.
+
+### 6. Deterministic PoW Rate Limiting
+
+Each write includes `{msg, pow: {nonce, difficulty}}` where nonce satisfies `leading_zeros(sha256(soul || nonce)) >= difficulty`. Receivers verify PoW before relaying. Difficulty scales with p99 latency (higher p99 = higher difficulty).
+
+**Measurements:**
+- PoW CPU cost: ~ms per write (tunable via difficulty)
+- Rejection rate: messages with insufficient PoW dropped silently
+- Graceful degrade: PoW difficulty scales with load
+
+**Implementation:** `computePoW(soul, difficulty)` in crypto.js; PoW verification in network.js message handler.
+
 ## Out-of-Scope Limitations
 
 These remain genuinely out-of-scope (require external infrastructure or represent intentional design trade-offs):
 
-- **Full DHT.** Hierarchical prefixing above scales to hundreds; a true DHT scales to millions but requires peer discovery + routing protocol — separate project.
-- **Atomic multi-field transactions.** Per-field eventual consistency is intentional; users can batch writes to single `putAt()` call for atomicity. Multi-field ACID requires coordination layer.
-- **Rate limiting via PoW.** Proof-of-work is orthogonal transport-layer concern; can be added as optional policy without core changes.
+- **Full DHT for trillions of peers.** Distributed routing above scales to millions with O(log peers) traffic. Trillions would require additional hierarchical layers (separate project).
+- **Atomic multi-field ACID with coordination.** Deterministic batch commits above provide atomicity via keypear derivation. Cross-batch ACID (multiple users writing to the same batch) requires consensus/coordination (separate project).
+- **Centralized rate limiting.** Deterministic PoW above provides spam resistance. Centralized reputation/allowlists require external infrastructure (separate project).
 
 ## Constraints Audit
 

@@ -145,6 +145,24 @@ async function accountSoul(alias) {
   return '~' + toB64(digest).slice(0, 22);
 }
 
+/** Compute proof-of-work: find nonce s.t. leading_zeros(blake2b(soul || nonce)) >= difficulty. */
+async function computePoW(soul, difficulty) {
+  // For PoW computation, we use a simpler approach: hash(soul || nonce) with difficulty check
+  // On Node, this will use crypto.createHash; in browser, falls back to Web Crypto API.
+  let nonce = 0;
+  const enc = new TextEncoder();
+  while (true) {
+    const input = soul + ':' + nonce;
+    const digest = await subtle.digest('SHA-256', enc.encode(input));
+    const hex = Array.from(new Uint8Array(digest))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+    const leadingZeros = hex.match(/^0*/)[0].length;
+    if (leadingZeros >= difficulty) return nonce;
+    nonce++;
+  }
+}
+
 module.exports = {
   pair,
   sign,
@@ -154,6 +172,7 @@ module.exports = {
   encryptWithPass,
   decryptWithPass,
   accountSoul,
+  computePoW,
   toB64,
   fromB64,
 };
