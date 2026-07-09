@@ -43,6 +43,7 @@ class Network {
     this.metrics = { messagesReceived: 0, messagesSent: 0, bytesSent: 0, peersConnected: 0 };
     this.latencies = { send_ms: [], receive_ms: [] }; // ring buffers for latency tracking
     this.maxLatencySamples = 1000; // keep last 1000 samples per operation
+    this.writeRateScale = 1.0; // adaptive backpressure: scale factor for batch size
 
     if (isNode && this.opts.server) this._startServer();
     for (const url of this.opts.peers || []) this._dial(url);
@@ -111,9 +112,38 @@ class Network {
     return msg;
   }
 
+  _isKeychainDerived(soul) {
+    // Check if soul looks like a hex Ed25519 public key (64 hex chars)
+    return /^[0-9a-f]{64}$/.test(soul);
+  }
+
+  _getPrefixMatches(soul, peers) {
+    // Extract prefix from soul: first 4 hex chars = 16 bits
+    if (!this._isKeychainDerived(soul)) return peers; // fallback: flood-fill
+    const soulPrefix = soul.substring(0, 4);
+    // Return only peers whose peerId matches the prefix (if available)
+    return peers; // TODO: implement peer ID tracking for prefix-based routing
+  }
+
+  _updateBackpressure() {
+    // If p99 latency exceeds 100ms, reduce write rate by 10%
+    const metrics = this.getMetrics();
+    const p99 = Math.max(
+      metrics.latencies.send_ms.p99,
+      metrics.latencies.receive_ms.p99
+    );
+    if (p99 > 100) {
+      this.writeRateScale = Math.max(0.1, this.writeRateScale * 0.9);
+    } else if (p99 < 50) {
+      this.writeRateScale = Math.min(1.0, this.writeRateScale * 1.05);
+    }
+  }
+
   _relay(msg, exceptSocket) {
     const sendStart = Date.now() + Math.random() / 1000;
     const data = JSON.stringify(msg);
+    // Update adaptive backpressure before relay
+    this._updateBackpressure();
     for (const ws of this.sockets) {
       if (ws === exceptSocket) continue;
       const state = isNode ? ws.readyState : ws.readyState;
