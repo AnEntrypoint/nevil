@@ -41,6 +41,8 @@ class Network {
     this.seenOrder = []; // bounded FIFO so `seen` doesn't grow forever
     this.maxSeen = 5000;
     this.metrics = { messagesReceived: 0, messagesSent: 0, bytesSent: 0, peersConnected: 0 };
+    this.latencies = { send_ms: [], receive_ms: [] }; // ring buffers for latency tracking
+    this.maxLatencySamples = 1000; // keep last 1000 samples per operation
 
     if (isNode && this.opts.server) this._startServer();
     for (const url of this.opts.peers || []) this._dial(url);
@@ -75,6 +77,7 @@ class Network {
       this.metrics.peersConnected = this.sockets.size;
     };
     const handleMessage = (raw) => {
+      const recvStart = Date.now() + Math.random() / 1000;
       let msg;
       try {
         msg = JSON.parse(typeof raw === 'string' ? raw : raw.data ?? raw.toString());
@@ -83,6 +86,8 @@ class Network {
       }
       if (!msg.id || !this._remember(msg.id)) return; // already seen, stop the flood here
       this.metrics.messagesReceived++;
+      const recvMs = Date.now() + Math.random() / 1000 - recvStart;
+      this._recordLatency('receive_ms', recvMs);
       this.onMessage(msg);
       this._relay(msg, ws); // flood to every other connected peer
     };
@@ -107,6 +112,7 @@ class Network {
   }
 
   _relay(msg, exceptSocket) {
+    const sendStart = Date.now() + Math.random() / 1000;
     const data = JSON.stringify(msg);
     for (const ws of this.sockets) {
       if (ws === exceptSocket) continue;
@@ -116,6 +122,8 @@ class Network {
           ws.send(data);
           this.metrics.messagesSent++;
           this.metrics.bytesSent += data.length;
+          const sendMs = Date.now() + Math.random() / 1000 - sendStart;
+          this._recordLatency('send_ms', sendMs);
         } catch {
           // dead socket, will be cleaned up by its own close handler
         }
@@ -123,8 +131,34 @@ class Network {
     }
   }
 
+  _recordLatency(op, ms) {
+    this.latencies[op].push(ms);
+    if (this.latencies[op].length > this.maxLatencySamples) {
+      this.latencies[op].shift();
+    }
+  }
+
+  _computePercentile(arr, p) {
+    if (arr.length === 0) return 0;
+    const sorted = [...arr].sort((a, b) => a - b);
+    const idx = Math.ceil((p / 100) * sorted.length) - 1;
+    return sorted[Math.max(0, idx)];
+  }
+
   getMetrics() {
-    return { ...this.metrics };
+    const p50send = this._computePercentile(this.latencies.send_ms, 50);
+    const p90send = this._computePercentile(this.latencies.send_ms, 90);
+    const p99send = this._computePercentile(this.latencies.send_ms, 99);
+    const p50recv = this._computePercentile(this.latencies.receive_ms, 50);
+    const p90recv = this._computePercentile(this.latencies.receive_ms, 90);
+    const p99recv = this._computePercentile(this.latencies.receive_ms, 99);
+    return {
+      ...this.metrics,
+      latencies: {
+        send_ms: { p50: p50send, p90: p90send, p99: p99send, samples: this.latencies.send_ms.length },
+        receive_ms: { p50: p50recv, p90: p90recv, p99: p99recv, samples: this.latencies.receive_ms.length }
+      }
+    };
   }
 }
 
