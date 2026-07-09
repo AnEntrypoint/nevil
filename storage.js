@@ -147,9 +147,9 @@ class SoulIndex {
 class Storage {
   constructor(opts = {}) {
     if (isNode) {
-      this.log = new NodeLogStore(opts.file || './monogun-data/log.ndjson');
+      this.log = new NodeLogStore(opts.file || './nevil-data/log.ndjson');
     } else {
-      this.log = new BrowserLogStore(opts.dbName || 'monogun');
+      this.log = new BrowserLogStore(opts.dbName || 'nevil');
     }
     this.index = opts.enableIndex ? new SoulIndex() : null;
   }
