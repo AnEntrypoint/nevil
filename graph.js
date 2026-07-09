@@ -50,6 +50,11 @@ class Graph {
     this.wildcardListeners = new Set(); // fn(soul, node, changedFields)
     this.localClock = 0; // Lamport clock: monotonically increasing counter
     this.opts = opts;
+
+    // Lamport clock configuration (tunable per deployment)
+    this.CLOCK_MAX_JUMP = opts.clockMaxJump || 1000; // max clock steps ahead
+    this.CLOCK_FAST_THRESHOLD = opts.clockFastThreshold || 1000; // steps/sec for Byzantine detection
+    this.peerClocks = new Map(); // peerId -> lastClock seen (for replay detection)
   }
 
   _ensureNode(soul) {

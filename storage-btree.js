@@ -13,13 +13,22 @@ class BTreeIndex {
   constructor(opts = {}) {
     this.memtable = new Map(); // soul -> {data, state, timestamp}
     this.memtableSize = 0;
-    this.memtableSizeLimit = opts.memtableSizeLimit || 10 * 1024 * 1024; // 10MB default
+
+    // B-tree tuning parameters (configurable per deployment)
+    this.MEMTABLE_SIZE_LIMIT = opts.memtableSizeLimit || 10 * 1024 * 1024; // 10MB default
+    this.MEMTABLE_FLUSH_FREQ = opts.memtableFlushFreq || 5 * 60 * 1000; // 5 min default
+    this.SSTABLE_MERGE_THRESHOLD = opts.sstableMergeThreshold || 3; // merge when count >= 3
+    this.BLOOM_FILTER_FPR = opts.bloomFilterFpr || 0.01; // 1% false positive rate
+    this.SSTABLE_BLOCK_SIZE = opts.sstableBlockSize || 64 * 1024; // 64KB blocks
+
+    this.memtableSize = 0;
     this.memtableFlushTime = opts.memtableFlushTime || Date.now();
-    this.memtableFlushFreq = opts.memtableFlushFreq || 5 * 60 * 1000; // 5 min default
+    this.memtableSizeLimit = this.MEMTABLE_SIZE_LIMIT;
+    this.memtableFlushFreq = this.MEMTABLE_FLUSH_FREQ;
 
     this.sstables = []; // array of {index: Map, minSoul, maxSoul, timestamp}
     this.bloomFilters = []; // optional: false-positive filters for quick negatives
-    this.blockSize = opts.blockSize || 64 * 1024; // 64KB default
+    this.blockSize = this.SSTABLE_BLOCK_SIZE; // 64KB default
   }
 
   /** Write entry to memtable. Returns true if flush needed. */

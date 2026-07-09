@@ -50,6 +50,31 @@ class Network {
     this.reputationCache = new Map(); // peerId -> total reputation sum (sum of all deltas)
     this.messageQueue = []; // messages queued from throttled peers
 
+    // DHT tuning parameters
+    this.DHT_K = opts.dhtK || 3; // K-nearest peers per bucket
+    this.DHT_L = opts.dhtL || 2; // L adjacent buckets to gossip to
+    this.DHT_GEOHASH_LENGTH = opts.dhtGeohashLength || 4; // geohash precision (4-8 chars)
+    this.DHT_HEALTH_UPDATE_FREQ = opts.dhtHealthUpdateFreq || 5000; // update health every 5s
+    this.DHT_FALLBACK_THRESHOLD = opts.dhtFallbackThreshold || 3000; // fallback to broadcast after 3s no ACK
+    this.DHT_ENABLED = opts.dhtEnabled !== false; // enable DHT (default true)
+
+    // Lamport clock guards
+    this.CLOCK_MAX_JUMP = opts.clockMaxJump || 1000; // max clock steps ahead allowed
+    this.CLOCK_FAST_THRESHOLD = opts.clockFastThreshold || 1000; // steps/sec for Byzantine detection
+    this.CLOCK_CONSENSUS_SPREAD = opts.clockConsensusSpread || 10000; // max acceptable peer clock spread
+
+    // Reputation thresholds
+    this.REP_ACCEPT_THRESHOLD = opts.repAcceptThreshold || 0; // score >= this: accept
+    this.REP_QUEUE_MIN = opts.repQueueMin || -10; // score in [-10, 0): queue
+    this.REP_DROP_THRESHOLD = opts.repDropThreshold || -10; // score < -10: drop
+    this.REP_DELTA_GOOD = opts.repDeltaGood || 1; // +1 for valid write
+    this.REP_DELTA_MALFORMED = opts.repDeltaMalformed || -1; // -1 for malformed
+    this.REP_DELTA_REPLAY = opts.repDeltaReplay || -5; // -5 for replay/duplicate
+    this.REP_DELTA_BYZANTINE = opts.repDeltaByzantine || -3; // -3 for Byzantine behavior
+    this.REP_DELTA_ROUTING_HELP = opts.repDeltaRoutingHelp || 10; // +10 for routing help
+    this.QUEUE_RETRY_DELAY = opts.queueRetryDelay || 5000; // retry queued messages every 5s
+    this.QUEUE_MAX_RETRIES = opts.queueMaxRetries || 5; // max retries before drop
+
     if (isNode && this.opts.server) this._startServer();
     for (const url of this.opts.peers || []) this._dial(url);
   }
