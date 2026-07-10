@@ -70,6 +70,8 @@ async function run() {
   assert.ok(accepted, 'honest write with valid PoW must be accepted');
   assert.strictEqual(rejections, 5, 'all spam writes without PoW must be rejected');
 
+  netA.close();
+  netB.close();
   server.close();
 
   const out = { rejections, puzzle_time_ms, verify_time_ms, accepted };

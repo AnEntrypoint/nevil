@@ -41,6 +41,8 @@ Supporting:
 
 ## API Surface
 
+- `close()` — tears down the network layer (all open sockets, the queue-drain timer, and any attached `WebSocketServer`) and unsubscribes graph listeners, so an embedding process can exit cleanly instead of an open socket/timer handle keeping the event loop alive indefinitely
+
 ### CRUD Operations (SQL/GraphQL-familiar)
 - `insert(fields)` — new record (auto-generated soul)
 - `select(query)` — retrieve with filter/sort/limit/offset
@@ -60,7 +62,8 @@ Supporting:
 - `unlock(soul, passphrase)` — recover keychain elsewhere
 - `capability(soul)` — public-key-only (read/verify, no sign)
 - `putAt(path, fields)` — signed write under keychain path
-- `getAtVerified(soul)` — read with signature verification
+- `getAtVerified(soul)` — read with signature verification; returns `{_owner, _path, ...verified fields}` — `_owner`/`_path` are the plain (already-verified) custody values, included on the result alongside every field whose per-field signature checks out
+- `network` rejects (drops + Byzantine-penalizes the sender) any `type:'put'` message targeting a keychain-derived soul (64-hex Ed25519 pubkey) that lacks both `sender` and `signature` — an unsigned write can never silently merge into an identity-addressed soul over the wire, closing the gap where omitting both fields skipped auth entirely
 - `boxPublicKeyAt(path)` — publish this identity's sub-address X25519 box public key (hex) for sealed-box encryption-for-recipient
 - `putEncrypted(soul, field, value, recipientBoxPublicKeyHex)` — write a sealed (confidential, not just signed) field addressed to a recipient's published box key
 - `getDecryptedAt(path, soul, field)` — decrypt a sealed field using the current identity's sub-address scalar
@@ -73,12 +76,14 @@ Supporting:
 - `network._computeGeohash(soul)` — deterministic geohash bucketing
 - `network.updatePeerHealth(peerId, latency, loss)` — track peer health scores
 - `network.getHealthyPeers()` — retrieve peers sorted by health
+- `network.broadcast(payload, lamportClock)` — starts a `dhtFallbackThreshold` timer; if the message id is never observed looping back through the mesh (the real receipt signal) within the threshold, it force-reflloods to every connected peer instead of staying confined to the original DHT-selected subset
 - Config: `dhtK`, `dhtL`, `dhtGeohashLength`, `dhtHealthUpdateFreq`, `dhtFallbackThreshold`, `dhtEnabled`
 
 ### Lamport Clocks (Transcendence 2: Causal consistency)
 - `graph.localClock` — monotonically incrementing clock counter
 - `graph.mergeNode(soul, fields, timestamps, lamportClock)` — merge with clock ordering
 - `network.broadcast(payload, lamportClock)` — include clock in messages
+- `graph.CLOCK_MAX_JUMP` — enforced in `mergeNode`: a field/batch lamport clock more than `CLOCK_MAX_JUMP` steps ahead of `localClock` is clamped rather than accepted verbatim, so one Byzantine peer can't advertise an arbitrary clock and permanently win every future HAM comparison for a field
 - Config: `clockMaxJump`, `clockFastThreshold`, `clockConsensusSpread`
 
 ### Reputation Ledger (Transcendence 3: Byzantine-resistant throttling)
@@ -88,6 +93,9 @@ Supporting:
 - `network.isByzantineIsolated(peerId, threshold)` — check if isolated
 - Delta reasons: 'good', 'malformed', 'replay', 'byzantine', 'routing-help'
 - Config: `repAcceptThreshold`, `repQueueMin`, `repDropThreshold`, `repDelta*`, `queueRetryDelay`, `queueMaxRetries`
+- Messages from a `queue`-throttled sender are held in `network.messageQueue` (bounded FIFO, `maxQueuedMessages`) and actively drained by `network._drainQueue()` on a `queueRetryDelay` timer: each retry re-checks the sender's current throttle state, delivering once reputation recovers to `accept` and dropping after `queueMaxRetries` if it never does
+- Gossip of the reputation ledger (`nevil.js` attaching it to every `put` broadcast) sends only the delta slice accrued since the last gossip, not the full ledger; receivers dedup incoming entries by identity before summing into `reputationCache`, so a re-delivered message can't double-count the same historical delta
+- `nevil.mergeReputationLedger(entries)` validates `peerId`/`delta` shape and clamps both the delta magnitude and the accepted lamport-clock jump before applying — a malformed or hostile entry can't blacklist an arbitrary peer or inflate the global clock unboundedly
 
 ### Configurable Conflict Resolution (Transcendence 5: pluggable HAM strategy)
 - `graph.resolveConflict` — the active strategy fn: `(incomingTs, incomingVal, currentTs, currentVal, incomingLamport, currentLamport) => boolean`

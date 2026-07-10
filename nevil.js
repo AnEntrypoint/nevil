@@ -128,8 +128,16 @@ class Nevil {
       // disk full, permission error) would otherwise crash the process on
       // an otherwise-recoverable I/O error.
       this.storage.persist(soul, fields, ts, lamport).catch((err) => this._onPersistError(err, soul));
-      // Gossip reputation ledger along with graph writes
-      let msg = { type: 'put', soul, fields, ts, reputationLedger: this.network.reputationLedger, lamportClock: this._lamportClock };
+      // Gossip only reputation deltas accrued since the last gossip, not the
+      // entire ledger every message — attaching up to maxReputationLedger
+      // (20000) entries on every single put both bloats bandwidth per-message
+      // and causes receivers to re-sum the SAME historical deltas repeatedly
+      // (see network.js handleMessage reputationLedger merge), inflating
+      // reputationCache far beyond the real sum of distinct deltas.
+      const gossipFrom = this._lastGossipedLedgerLength || 0;
+      const reputationLedger = this.network.reputationLedger.slice(gossipFrom);
+      this._lastGossipedLedgerLength = this.network.reputationLedger.length;
+      let msg = { type: 'put', soul, fields, ts, reputationLedger, lamportClock: this._lamportClock };
       if (this.network.POW_ENABLED) {
         msg.pow = Network.solvePoW(soul, this.network.POW_DIFFICULTY);
       }
@@ -155,6 +163,12 @@ class Nevil {
 
   ready() {
     return this._ready;
+  }
+
+  /** Tear down the network layer and unsubscribe graph listeners so this instance can be cleanly discarded. */
+  close() {
+    this.network.close();
+    if (this._unsubAny) this._unsubAny();
   }
 
   _applyRemote(msg) {
@@ -369,9 +383,13 @@ class Nevil {
 
     const profile = { soul, createdAt: Date.now() };
     if (alias) profile.alias = alias;
-    this.put(soul, profile);
-
+    // Set _identity BEFORE put() so the onAny broadcast handler signs this
+    // write like any other identity-owned message — this.soul IS a
+    // keychain-derived (64-hex) address, so an unsigned broadcast of it
+    // would now be rejected by the network's own auth-bypass guard on
+    // receipt (a keychain-derived soul's put must carry sender+signature).
     this._identity = { keychain, soul };
+    this.put(soul, profile);
     return { soul, keychain };
   }
 
@@ -392,8 +410,8 @@ class Nevil {
       profile.sealedSeed = sealed;
     }
 
-    this.put(soul, profile);
     this._identity = { keychain, soul };
+    this.put(soul, profile);
     return { soul, keychain };
   }
 
@@ -527,9 +545,16 @@ class Nevil {
     }
     if (expectedChain.get().toHex() !== subSoul) return undefined; // custody chain doesn't match — forged claim
 
-    const out = {};
+    // Custody markers are already verified above (their own unwrapped
+    // signing scheme, not the {k, v} field scheme) — surface their plain
+    // values on the result so callers can read back _owner/_path, same as
+    // any other verified field. Previously these were skipped entirely in
+    // the loop below with no replacement, so a caller could never actually
+    // read the verified owner/path back from getAtVerified despite the
+    // custody check having already proven them authentic.
+    const out = { _owner: node._owner.v, _path: node._path.v };
     for (const [k, v] of Object.entries(node)) {
-      if (k === '_owner' || k === '_path') continue; // custody markers, already verified above with their own (unwrapped) signing scheme
+      if (k === '_owner' || k === '_path') continue; // handled above
       if (v && typeof v === 'object' && v.sig) {
         // Verify against {k, v} together, matching putAt's signing scheme —
         // a signature only ever covers the specific field name it was made
@@ -603,9 +628,20 @@ class Nevil {
 
   /** Merge remote reputation entries into the network ledger (for gossip). */
   mergeReputationLedger(entries) {
+    if (!Array.isArray(entries)) return;
     for (const entry of entries) {
-      this.network.updateReputation(entry.peerId, entry.delta, entry.reason);
-      if (entry.lamportClock > this._lamportClock) this._lamportClock = entry.lamportClock + 1;
+      // Validate shape before applying: an unvalidated caller-supplied
+      // peerId/delta previously let a single call blacklist an arbitrary
+      // honest peer (unbounded negative delta) or inflate the global Lamport
+      // clock without limit (same poisoning class CLOCK_MAX_JUMP guards
+      // against elsewhere — apply the same clamp here).
+      if (!entry || typeof entry.peerId !== 'string' || typeof entry.delta !== 'number' || !Number.isFinite(entry.delta)) continue;
+      const delta = Math.max(-100, Math.min(100, entry.delta));
+      this.network.updateReputation(entry.peerId, delta, entry.reason);
+      if (typeof entry.lamportClock === 'number' && Number.isFinite(entry.lamportClock)) {
+        const clamped = Math.min(entry.lamportClock, this._lamportClock + this.network.CLOCK_MAX_JUMP);
+        if (clamped > this._lamportClock) this._lamportClock = clamped + 1;
+      }
     }
   }
 }

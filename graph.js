@@ -138,9 +138,15 @@ class Graph {
     const perField = lamportClock !== null && typeof lamportClock === 'object';
     let batchClock;
     if (!perField && lamportClock !== undefined) {
-      if (lamportClock > this.localClock) this.localClock = lamportClock;
+      // Clamp a Byzantine batch clock the same way the per-field path does,
+      // so a single external message can't jump localClock arbitrarily far
+      // ahead and permanently win every subsequent HAM comparison.
+      const clamped = lamportClock > this.localClock + this.CLOCK_MAX_JUMP
+        ? this.localClock + this.CLOCK_MAX_JUMP
+        : lamportClock;
+      if (clamped > this.localClock) this.localClock = clamped;
       this.localClock++; // increment after receiving external message
-      batchClock = lamportClock;
+      batchClock = clamped;
     } else if (!perField) {
       this.localClock++; // local write advances the local clock
       batchClock = this.localClock;
@@ -149,7 +155,16 @@ class Graph {
     const changed = [];
     for (const field of fieldNames) {
       const ts = timestamps[field];
-      const incomingClock = perField ? lamportClock[field] : batchClock;
+      let incomingClock = perField ? lamportClock[field] : batchClock;
+      // Byzantine clock guard: a peer advertising an implausibly large jump
+      // ahead of our own clock would otherwise win every future HAM
+      // comparison for this field forever (CLOCK_MAX_JUMP was previously
+      // declared but never enforced). Clamp the accepted clock to at most
+      // CLOCK_MAX_JUMP past our current localClock so one malicious message
+      // can't permanently poison a field's conflict-resolution ordering.
+      if (incomingClock !== undefined && incomingClock > this.localClock + this.CLOCK_MAX_JUMP) {
+        incomingClock = this.localClock + this.CLOCK_MAX_JUMP;
+      }
       if (perField && incomingClock !== undefined && incomingClock > this.localClock) this.localClock = incomingClock;
       const currentLamport = this.nodes.get(soul)?.lamport[field];
       if (this.mergeField(soul, field, fields[field], ts, incomingClock, currentLamport)) {

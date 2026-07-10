@@ -145,8 +145,28 @@ class Network {
         this.updateReputation(this._getPeerKey(ws), this.REP_DELTA_MALFORMED, 'malformed');
         return;
       }
-      if (!this._remember(msg.id)) return; // already seen, stop the flood here
-      // Signature verification: keypear-derived sender authenticity
+      if (!this._remember(msg.id)) {
+        // Seeing our own message id relayed back (mesh loop-back) is the
+        // real-traffic ACK signal for the DHT_FALLBACK_THRESHOLD timer in
+        // broadcast(): it proves at least one peer actually received and
+        // is propagating this message, so the flood-fill fallback is unneeded.
+        this._ackedIds = this._ackedIds || new Set();
+        this._ackedIds.add(msg.id);
+        if (this._ackedIds.size > this.maxSeen) this._ackedIds.delete(this._ackedIds.values().next().value);
+        return; // already seen, stop the flood here
+      }
+      // Signature verification: keypear-derived sender authenticity. A `put`
+      // targeting a keychain-derived soul (64-hex Ed25519 pubkey) MUST carry a
+      // valid signature — omitting both `sender`/`signature` used to skip
+      // verification entirely and merge straight into the graph, defeating
+      // the putAt/getAtVerified ownership model for anyone relaying raw puts.
+      // Plain (non-keychain) souls have no identity to verify against, so
+      // they are unaffected — this only closes the identity-forgery gap.
+      if (msg.type === 'put' && this._isKeychainDerived(msg.soul) && !(msg.sender && msg.signature)) {
+        this.metrics.signatureDropped = (this.metrics.signatureDropped || 0) + 1;
+        this.updateReputation(this._getPeerKey(ws), this.REP_DELTA_BYZANTINE, 'byzantine');
+        return; // unsigned write to an identity-addressed soul, drop and penalize
+      }
       if (msg.sender && msg.signature && !this._verifySignature(msg.sender, msg, msg.signature)) {
         this.metrics.signatureDropped = (this.metrics.signatureDropped || 0) + 1;
         this.updateReputation(msg.sender, this.REP_DELTA_BYZANTINE, 'byzantine');
@@ -181,9 +201,22 @@ class Network {
         this.updateReputation(msg.sender || 'unknown', this.REP_DELTA_BYZANTINE, 'byzantine');
         return; // PoW failed, drop and penalize sender
       }
-      // Reputation gossip: update cache if message includes reputation data
+      // Reputation gossip: fold in only entries not already applied. Each
+      // sender now gossips its ledger tail (see nevil.js), but a message can
+      // still be re-delivered via a different route, so dedup by identity
+      // (peerId+delta+reason+timestamp) before summing — otherwise the same
+      // historical delta gets re-added to reputationCache on every repeat
+      // delivery, inflating scores far past the true sum of distinct deltas.
       if (msg.reputationLedger && Array.isArray(msg.reputationLedger)) {
+        this._seenReputationEntries = this._seenReputationEntries || new Set();
         for (const entry of msg.reputationLedger) {
+          if (!entry || typeof entry.peerId !== 'string' || typeof entry.delta !== 'number') continue;
+          const entryKey = entry.peerId + '|' + entry.delta + '|' + entry.reason + '|' + entry.timestamp;
+          if (this._seenReputationEntries.has(entryKey)) continue;
+          this._seenReputationEntries.add(entryKey);
+          if (this._seenReputationEntries.size > this.maxReputationLedger) {
+            this._seenReputationEntries.delete(this._seenReputationEntries.values().next().value);
+          }
           const sum = this.reputationCache.get(entry.peerId) || 0;
           this.reputationCache.set(entry.peerId, sum + entry.delta);
         }
@@ -196,9 +229,15 @@ class Network {
         return; // drop low-reputation sender silently
       }
       if (throttleState === 'queue') {
-        // queue the message; relay later when sender reputation recovers
+        // Queue the message; relay later when sender reputation recovers.
+        // Bounded FIFO (maxQueuedMessages) and periodic drain (_drainQueue,
+        // scheduled below) — previously nothing ever read this queue, so it
+        // grew unboundedly and every queued write was silently lost forever
+        // even after the sender's reputation recovered.
         this.messageQueue = this.messageQueue || [];
-        this.messageQueue.push({ msg, receivedAt: Date.now() });
+        this.messageQueue.push({ msg, senderId, receivedAt: Date.now(), retries: 0 });
+        if (this.messageQueue.length > (this.opts.maxQueuedMessages || 10000)) this.messageQueue.shift();
+        this._scheduleQueueDrain();
         return;
       }
       // throttleState === 'accept': process normally
@@ -228,6 +267,18 @@ class Network {
     const msg = { id: randomId(), lamportClock: lamportClock || 0, ...payload };
     this._remember(msg.id);
     this._relay(msg, null);
+    // DHT_FALLBACK_THRESHOLD ACK timeout: a DHT-routed (non-flood-fill) send
+    // to a bounded peer subset is fire-and-forget with no receipt signal, so
+    // a message to an unresponsive bucket could otherwise vanish silently.
+    // If no peer relays this id back to us (via _relay's re-broadcast of
+    // already-seen ids, tracked in `seen`) within the threshold, re-send as
+    // a true flood-fill to every connected peer.
+    if (this.DHT_ENABLED && this.sockets.size > 0) {
+      const timer = setTimeout(() => {
+        if (!this._ackedIds?.has(msg.id)) this._relay(msg, null, true);
+      }, this.DHT_FALLBACK_THRESHOLD);
+      if (timer.unref) timer.unref();
+    }
     return msg;
   }
 
@@ -304,20 +355,22 @@ class Network {
     }
   }
 
-  _relay(msg, exceptSocket) {
+  _relay(msg, exceptSocket, forceFlood = false) {
     const sendStart = Date.now();
     const data = JSON.stringify(msg);
     // Update adaptive backpressure before relay
     this._updateBackpressure();
 
-    // DHT routing: route message via geohash bucket or fallback to broadcast
-    const targetPeers = this._selectRoutingPeers(msg);
+    // DHT routing: route message via geohash bucket or fallback to broadcast.
+    // forceFlood (DHT_FALLBACK_THRESHOLD ACK-timeout retry) bypasses bucket
+    // selection entirely and sends to every connected peer.
+    const targetPeers = forceFlood ? null : this._selectRoutingPeers(msg);
 
     for (const ws of this.sockets) {
       if (ws === exceptSocket) continue;
       // Only send if peer is in target list (DHT-routed)
       const peerKey = this._getPeerKey(ws);
-      if (!targetPeers.has(peerKey) && this.DHT_ENABLED) continue;
+      if (targetPeers && !targetPeers.has(peerKey) && this.DHT_ENABLED) continue;
 
       const state = isNode ? ws.readyState : ws.readyState;
       if (state === 1 /* OPEN */) {
@@ -535,6 +588,40 @@ class Network {
     return this.reputationLedger.filter(e => e.peerId === peerId);
   }
 
+  /**
+   * Drain queued messages from senders whose reputation has since recovered
+   * to 'accept'. Re-checks each queued entry's current throttle state rather
+   * than assuming recovery; entries still throttled are re-queued up to
+   * QUEUE_MAX_RETRIES before being dropped, so a permanently low-reputation
+   * sender's backlog doesn't sit in memory forever.
+   */
+  _drainQueue() {
+    if (!this.messageQueue || this.messageQueue.length === 0) return;
+    const remaining = [];
+    for (const item of this.messageQueue) {
+      const state = this.getThrottleState(item.senderId);
+      if (state === 'accept') {
+        this.metrics.messagesReceived++;
+        this.onMessage(item.msg);
+        this._relay(item.msg, null);
+      } else if (state === 'queue' && item.retries < this.QUEUE_MAX_RETRIES) {
+        item.retries++;
+        remaining.push(item);
+      } // 'drop' or retries exhausted: dropped, not re-queued
+    }
+    this.messageQueue = remaining;
+  }
+
+  _scheduleQueueDrain() {
+    if (this._queueDrainTimer) return;
+    this._queueDrainTimer = setTimeout(() => {
+      this._queueDrainTimer = null;
+      this._drainQueue();
+      if (this.messageQueue && this.messageQueue.length > 0) this._scheduleQueueDrain();
+    }, this.QUEUE_RETRY_DELAY);
+    if (this._queueDrainTimer.unref) this._queueDrainTimer.unref();
+  }
+
   /** Decide message throttle state: accept (>=0), queue ([-10,0)), or drop (<-10). */
   getThrottleState(peerId) {
     const rep = this.getReputation(peerId);
@@ -546,6 +633,24 @@ class Network {
   /** Check if peer is in Byzantine isolation (reputation < threshold). */
   isByzantineIsolated(peerId, threshold = -20) {
     return this.getReputation(peerId) < threshold;
+  }
+
+  /**
+   * Tear down every open socket, pending timer, and the attached
+   * WebSocketServer (if any). `http.Server.close()`/`WebSocketServer.close()`
+   * alone only stop ACCEPTING new connections — already-open sockets and
+   * scheduled setTimeout handles (redial, queue drain, DHT ACK fallback)
+   * keep the event loop alive indefinitely, so an embedding process could
+   * never exit cleanly without this.
+   */
+  close() {
+    if (this._queueDrainTimer) { clearTimeout(this._queueDrainTimer); this._queueDrainTimer = null; }
+    for (const ws of this.sockets) {
+      ws._redialScheduled = true; // suppress self-heal redial on close
+      try { ws.terminate ? ws.terminate() : ws.close(); } catch { /* already closed */ }
+    }
+    this.sockets.clear();
+    if (this.wss) { try { this.wss.close(); } catch { /* already closed */ } }
   }
 }
 

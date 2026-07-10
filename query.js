@@ -61,6 +61,7 @@ function compareSortKeys(av, bv, sortOrder) {
 
 function applyFilter(node, filter) {
   if (!filter) return true;
+  if (!node) return false;
   for (const [key, condition] of Object.entries(filter)) {
     if (!(key in node)) return false;
     const v = node[key];
@@ -71,7 +72,7 @@ function applyFilter(node, filter) {
       if ('$gte' in condition && !(v >= condition.$gte)) return false;
       if ('$lt' in condition && !(v < condition.$lt)) return false;
       if ('$lte' in condition && !(v <= condition.$lte)) return false;
-      if ('$in' in condition && !condition.$in.includes(v)) return false;
+      if ('$in' in condition && (!Array.isArray(condition.$in) || !condition.$in.includes(v))) return false;
     } else if (v !== condition) return false;
   }
   return true;
@@ -91,6 +92,12 @@ function resolveOne(graph, soul, q, depth, maxDepth) {
   if (maxDepth === undefined) maxDepth = q.maxDepth != null ? q.maxDepth : 32;
   const node = graph.get(soul);
   if (depth > maxDepth) {
+    // A node that the active filter would exclude must still be excluded at
+    // the depth cutoff — returning the _depthExceeded stub before filtering
+    // let a filtered-out node leak into results exactly at the maxDepth
+    // boundary, since applyFilter was previously only reached in the
+    // non-cutoff branch below.
+    if (!applyFilter(node, q.filter)) return null;
     // Include the node's own requested scalar fields at the cutoff so a
     // caller can't misread "field omitted" as "field is empty" — only
     // further nested traversal is actually truncated here.
