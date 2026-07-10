@@ -435,11 +435,11 @@ All eleven prior limitations have been reclassified as in-scope and fully implem
 ### 6. **No Explicit Topology → Named AP/CA/CP Modes** (Transcendence 6)
 **Problem:** No first-class way to declare which two of {consistency, availability, partition tolerance} a deployment optimizes for; users had to hand-configure DHT/clock/conflict options to approximate a topology.
 
-**Solution:** `Nevil({ topology: 'ap' | 'ca' | 'cp' })` resolves a preset (conflict strategy + DHT flag) before construction. Per the CAP theorem, no mode claims all three properties — each preset just names its trade-off honestly. Any opt passed alongside `topology` overrides that preset field.
+**Solution:** `Nevil({ topology: 'ap' | 'ca' | 'cp' })` resolves a preset (conflict strategy + DHT flag + quorum fraction) before construction. Per the CAP theorem, no mode claims all three properties — each preset just names its trade-off honestly. Any opt passed alongside `topology` overrides that preset field.
 
-- **`topology: 'ap'`** — Availability + partition tolerance. Flood-fill gossip (no DHT), LWW. Writes always succeed locally; reconverges eventually on reconnect.
-- **`topology: 'ca'`** — Consistency + availability. Flood-fill gossip (no DHT), LWW. Assumes no partition; if one occurs anyway, this mode degrades like AP rather than blocking writes — it was never designed to detect or specially handle a split.
-- **`topology: 'cp'`** — Consistency + partition tolerance. DHT-aware bounded-subset routing enabled, LWW. Lamport clocks (always active) give causal ordering across a partition.
+- **`topology: 'ap'`** — Availability + partition tolerance. Flood-fill gossip (no DHT), LWW, no quorum gate. Writes always succeed locally; reconverges eventually on reconnect.
+- **`topology: 'ca'`** — Consistency + availability. Flood-fill gossip (no DHT), LWW, **real quorum gate** (`quorumFraction: 0.5` by default): `put()` throws if fewer than half of `opts.peers` are currently connected, instead of silently accepting the write like AP would. This is what actually distinguishes CA from AP — a genuine availability sacrifice during a partition, not just a differently-labeled identical config.
+- **`topology: 'cp'`** — Consistency + partition tolerance. DHT-aware bounded-subset routing enabled, LWW, no quorum gate. Lamport clocks (always active) give causal ordering across a partition; unlike CA, writes are never rejected.
 
 **Implementation:** `nevil.js` `TOPOLOGY_PRESETS`/`resolveTopologyOpts()` applied in the constructor before `storage`/`graph`/`network` are built. Witness: `tools/witness-topology-modes.js` asserts each mode's configuration and the override behavior; `tools/witness-ha-ca-cp-integration.js` proves a real 2-peer mesh under CA + PoW replicates correctly.
 
@@ -476,7 +476,7 @@ Full-system test: `tools/witness-integration.js` asserts `A.putAt(...)` gossips 
 
 ## CAP Theorem Modes (AP/CA/CP)
 
-Nevil's constructor accepts a `topology` parameter to name which two of {consistency, availability, partition tolerance} a deployment optimizes for — see Transcendence 6 above for the full description and honest residuals (CA mode does not detect partitions; it just wasn't designed to promise behavior during one). This replaces an earlier `capMode` parameter that was documented here but never implemented in code (a phantom API caught and fixed during this session's audit) — use `topology`, not `capMode`.
+Nevil's constructor accepts a `topology` parameter to name which two of {consistency, availability, partition tolerance} a deployment optimizes for — see Transcendence 6 above for the full description, including CA's real quorum enforcement. This replaces an earlier `capMode` parameter that was documented here but never implemented in code (a phantom API caught and fixed during this session's audit) — use `topology`, not `capMode`.
 
 ## Validation: Debugging and Troubleshooting Only
 
