@@ -51,6 +51,7 @@ class Network {
     this.reputationLedger = []; // bounded: {peerId, delta, reason, ts}
     this.maxReputationLedger = opts.maxReputationLedger || 20000; // FIFO cap on in-memory ledger (durable log is unaffected, see storage.js)
     this.reputationCache = new Map(); // peerId -> total reputation sum (sum of all deltas)
+    this.reputationCacheOrder = []; // bounded FIFO, mirrors seen/seenOrder — a gossiping peer must not grow this map unbounded via fabricated peerIds
     this.messageQueue = []; // messages queued from throttled peers
 
     // DHT tuning parameters
@@ -84,6 +85,22 @@ class Network {
 
     if (isNode && this.opts.server) this._startServer();
     for (const url of this.opts.peers || []) this._dial(url);
+  }
+
+  /**
+   * Set reputationCache[peerId] with the same bounded-FIFO discipline as
+   * `seen`/`seenOrder`: unlike the ledger arrays (already bounded by
+   * maxReputationLedger), the cache Map itself had no cap, so a peer
+   * gossiping a stream of fabricated peerIds could grow it without limit.
+   */
+  _setReputationCache(peerId, value) {
+    if (!this.reputationCache.has(peerId)) {
+      this.reputationCacheOrder.push(peerId);
+      if (this.reputationCacheOrder.length > this.maxReputationLedger) {
+        this.reputationCache.delete(this.reputationCacheOrder.shift());
+      }
+    }
+    this.reputationCache.set(peerId, value);
   }
 
   _remember(id) {
@@ -218,7 +235,7 @@ class Network {
             this._seenReputationEntries.delete(this._seenReputationEntries.values().next().value);
           }
           const sum = this.reputationCache.get(entry.peerId) || 0;
-          this.reputationCache.set(entry.peerId, sum + entry.delta);
+          this._setReputationCache(entry.peerId, sum + entry.delta);
         }
       }
       // Throttle gating: check sender reputation and decide accept/queue/drop
@@ -543,7 +560,7 @@ class Network {
 
   /** Update reputation cache (pull from gossip). */
   updateReputationCache(peerId, reputation) {
-    this.reputationCache.set(peerId, reputation);
+    this._setReputationCache(peerId, reputation);
   }
 
   /** Get cached reputation for peer. */
@@ -563,7 +580,7 @@ class Network {
     this.reputationLedger.push(entry);
     if (this.reputationLedger.length > this.maxReputationLedger) this.reputationLedger.shift();
     const currentRep = this.reputationCache.get(peerId) || 0;
-    this.reputationCache.set(peerId, currentRep + delta);
+    this._setReputationCache(peerId, currentRep + delta);
     if (this.onReputationDelta) this.onReputationDelta(entry);
     return entry;
   }
@@ -574,7 +591,7 @@ class Network {
       this.reputationLedger.push(entry);
       if (this.reputationLedger.length > this.maxReputationLedger) this.reputationLedger.shift();
       const currentRep = this.reputationCache.get(entry.peerId) || 0;
-      this.reputationCache.set(entry.peerId, currentRep + entry.delta);
+      this._setReputationCache(entry.peerId, currentRep + entry.delta);
     }
   }
 

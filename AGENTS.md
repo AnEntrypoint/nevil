@@ -96,6 +96,7 @@ Supporting:
 - Messages from a `queue`-throttled sender are held in `network.messageQueue` (bounded FIFO, `maxQueuedMessages`) and actively drained by `network._drainQueue()` on a `queueRetryDelay` timer: each retry re-checks the sender's current throttle state, delivering once reputation recovers to `accept` and dropping after `queueMaxRetries` if it never does
 - Gossip of the reputation ledger (`nevil.js` attaching it to every `put` broadcast) sends only the delta slice accrued since the last gossip, not the full ledger; receivers dedup incoming entries by identity before summing into `reputationCache`, so a re-delivered message can't double-count the same historical delta
 - `nevil.mergeReputationLedger(entries)` validates `peerId`/`delta` shape and clamps both the delta magnitude and the accepted lamport-clock jump before applying — a malformed or hostile entry can't blacklist an arbitrary peer or inflate the global clock unboundedly
+- `network.reputationCache` (the `peerId -> cumulative score` Map) is FIFO-bounded by `maxReputationLedger` the same as `seen`/`reputationLedger`, via `_setReputationCache()` at every write site — a peer gossiping a stream of fabricated `peerId`s can't grow the cache without limit
 
 ### Configurable Conflict Resolution (Transcendence 5: pluggable HAM strategy)
 - `graph.resolveConflict` — the active strategy fn: `(incomingTs, incomingVal, currentTs, currentVal, incomingLamport, currentLamport) => boolean`
