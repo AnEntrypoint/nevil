@@ -41,7 +41,7 @@ Supporting:
 
 ## API Surface
 
-- `close()` — tears down the network layer (all open sockets, the queue-drain timer, and any attached `WebSocketServer`) and unsubscribes graph listeners, so an embedding process can exit cleanly instead of an open socket/timer handle keeping the event loop alive indefinitely
+- `close()` — tears down the network layer (all open sockets, the queue-drain timer, and any attached `WebSocketServer`) and unsubscribes graph listeners, so an embedding process can exit cleanly instead of an open socket/timer handle keeping the event loop alive indefinitely; safe to call before `ready()` resolves (the constructor kicks off boot asynchronously without awaiting it, so `this.network` may not exist yet)
 
 ### CRUD Operations (SQL/GraphQL-familiar)
 - `insert(fields)` — new record (auto-generated soul)

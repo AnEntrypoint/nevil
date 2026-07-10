@@ -165,9 +165,16 @@ class Nevil {
     return this._ready;
   }
 
-  /** Tear down the network layer and unsubscribe graph listeners so this instance can be cleanly discarded. */
+  /**
+   * Tear down the network layer and unsubscribe graph listeners so this
+   * instance can be cleanly discarded. `this.network` is only assigned
+   * inside the async `_boot()` kicked off (not awaited) by the constructor,
+   * so a caller that closes before `ready()` resolves (a failed-fast
+   * request handler, a test harness tearing down after a construction
+   * error) would otherwise crash on `this.network` being undefined.
+   */
   close() {
-    this.network.close();
+    if (this.network) this.network.close();
     if (this._unsubAny) this._unsubAny();
   }
 
