@@ -376,7 +376,7 @@ Full Byzantine resilience without consensus protocol:
 - **Message authentication:** Every broadcast includes `{sender: soul, signature: sign(body)}`. Sender is keypear-derived identity (public key hex).
 - **Signature verification:** Network._relay() checks signature before relaying. Forged messages dropped silently.
 - **Lamport clock monotonicity:** Every peer tracks `peerClocks[senderId] = lastClock`. Messages with `lamportClock <= lastClock` rejected (prevents replay/rollback). Clock incremented on each batch write.
-- **Reputation + PoW:** Low-rep peers solve higher PoW difficulty (inversely: `difficulty = 1 / (reputation + 1)`). Reputation gossips via `_reputationLedger`. Sybil resistance via computation cost.
+- **Reputation + PoW (independent gates, not reputation-scaled difficulty):** Reputation gossips via the reputation ledger and throttles per-peer over time (accept/queue/drop by score). PoW, when enabled (`powEnabled`), gates admission per-message at a fixed `powDifficulty` — the two compose but PoW difficulty does not currently scale with a peer's reputation score (see AGENTS.md Residuals: adaptive PoW is named future work, not implemented).
 - **Metrics:** Network tracks `signatureDropped`, `clockDropped`, `powDropped` for observability.
 
 No consensus protocol, no coordinator. Cryptography + temporal ordering + computation cost = Byzantine boundaries.
@@ -489,8 +489,8 @@ This project uses **no synthetic tests**. All validation occurs via real executi
 
 Example: to witness AP mode merges causally independent writes on partition heal:
 ```js
-const peer1 = new Nevil({ capMode: 'AP' });
-const peer2 = new Nevil({ capMode: 'AP' });
+const peer1 = new Nevil({ topology: 'ap' });
+const peer2 = new Nevil({ topology: 'ap' });
 peer1.put('soul', { x: 'value1' });
 peer2.put('soul', { y: 'value2' });
 peer1._applyRemote({ soul: 'soul', fields: peer2.get('soul'), ts: {} });
