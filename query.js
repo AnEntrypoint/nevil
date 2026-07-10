@@ -60,8 +60,15 @@ function applyFilter(node, filter) {
   return true;
 }
 
+/**
+ * Recursion depth is bounded (default 32, override via `q.maxDepth`) so a
+ * cyclic graph can't stack-overflow. A cycle degrades to a truncated
+ * sub-tree marker instead of throwing — one deep/cyclic branch shouldn't
+ * fail the whole query when the rest of the result is perfectly valid.
+ */
 function resolveOne(graph, soul, q, depth) {
-  if (depth > 32) throw new Error('query depth limit exceeded (possible cycle in graph references)');
+  const maxDepth = q.maxDepth || 32;
+  if (depth > maxDepth) return { soul, _depthExceeded: true };
   const node = graph.get(soul);
   if (!node) return null;
 
@@ -93,8 +100,8 @@ function resolveOne(graph, soul, q, depth) {
         });
       }
 
-      if (sub.offset) resolved = resolved.slice(sub.offset);
-      if (sub.limit) resolved = resolved.slice(0, sub.limit);
+      if (sub.offset != null) resolved = resolved.slice(sub.offset);
+      if (sub.limit != null) resolved = resolved.slice(0, sub.limit);
 
       out[key] = resolved;
     } else if (isRef(raw)) {
@@ -133,8 +140,8 @@ function query(graph, q) {
       });
     }
 
-    if (q.offset) results = results.slice(q.offset);
-    if (q.limit) results = results.slice(0, q.limit);
+    if (q.offset != null) results = results.slice(q.offset);
+    if (q.limit != null) results = results.slice(0, q.limit);
 
     if (q.mapToRows) {
       return results.map((r) => {

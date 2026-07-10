@@ -36,26 +36,65 @@
 const { Graph, isRef, ref } = require('./graph');
 const { Storage } = require('./storage');
 const { Network } = require('./network');
-const { Keychain, KeyPair } = require('./keychain');
+const { Keychain, KeyPair, encryptFor: keychainEncryptFor } = require('./keychain');
 const sea = require('./crypto');
 const { query } = require('./query');
 
+// Topology presets: AP (availability+partition, no coordinator, eventual
+// consistency), CA (consistency+availability, no partition tolerance —
+// requires all peers reachable, LWW resolves conflicts synchronously in
+// flood-fill), CP (consistency+partition tolerance — DHT routing +
+// Lamport clocks give causal ordering under partition, at the cost of
+// full availability during a split). Per CAP theorem no topology gets all
+// three; `topology` just picks which two this instance optimizes for and
+// configures the graph/network accordingly. Any opt explicitly passed
+// overrides the preset (explicit config always wins over topology default).
+const TOPOLOGY_PRESETS = {
+  ap: { conflictResolution: 'lww', dhtEnabled: false },
+  ca: { conflictResolution: 'lww', dhtEnabled: false },
+  cp: { conflictResolution: 'lww', dhtEnabled: true },
+};
+
+function resolveTopologyOpts(opts) {
+  if (!opts.topology) return opts;
+  const mode = String(opts.topology).toLowerCase();
+  const preset = TOPOLOGY_PRESETS[mode];
+  if (!preset) throw new Error(`unknown topology: ${opts.topology} (expected ap, ca, or cp)`);
+  return { ...preset, ...opts };
+}
+
 class Nevil {
   constructor(opts = {}) {
+    opts = resolveTopologyOpts(opts);
     this.opts = opts;
+    this.topology = opts.topology ? String(opts.topology).toLowerCase() : null;
     this.storage = new Storage({ ...opts, enableIndex: opts.enableSoulIndex });
-    this.graph = new Graph();
+    this.graph = new Graph(opts);
     this._ready = this._boot();
     this._identity = null; // { keychain, soul } once logged in / created
     this._lamportClock = 0; // global lamport clock for cross-batch ACID
   }
 
   async _boot() {
-    this.graph = await this.storage.load(Graph);
+    this.graph = await this.storage.load(Graph, this.opts);
+    // Seed the nevil-level clock from the loaded graph's clock so the two
+    // counters (graph.localClock advances on merge; _lamportClock advances
+    // on gossip) start in sync instead of _lamportClock resetting to 0
+    // while graph.localClock resumes from the replayed history — divergence
+    // there would let a locally-gossiped write's advertised clock lag
+    // behind what the graph itself already recorded.
+    this._lamportClock = this.graph.localClock;
 
     this.network = new Network(this.opts, (msg) => {
       if (msg.type === 'put') this._applyRemote(msg);
     });
+
+    // Durable reputation ledger: replay before any live traffic so a
+    // restarted peer doesn't treat a previously-Byzantine peer as neutral,
+    // then persist every new delta so future restarts stay accurate.
+    const priorLedger = await this.storage.loadReputationLedger();
+    this.network.restoreReputationLedger(priorLedger);
+    this.network.onReputationDelta = (entry) => this.storage.persistReputationEntry(entry);
 
     // Every local write that actually changes state gets persisted and gossiped.
     this._unsubAny = this.graph.onAny((soul, node, changedFields) => {
@@ -63,14 +102,20 @@ class Nevil {
       this._lamportClock++; // advance global clock on every local (gossiped) write
       const fields = {};
       const ts = {};
+      const lamport = {};
+      const graphNode = this.graph.nodes.get(soul);
       for (const f of changedFields) {
         fields[f] = node[f];
         ts[f] = this.graph.getState(soul)[f];
+        lamport[f] = graphNode?.lamport[f];
       }
       if (this.storage.index) this.storage.index.add(soul);
-      this.storage.persist(soul, fields, ts);
+      this.storage.persist(soul, fields, ts, lamport);
       // Gossip reputation ledger along with graph writes
       let msg = { type: 'put', soul, fields, ts, reputationLedger: this.network.reputationLedger, lamportClock: this._lamportClock };
+      if (this.network.POW_ENABLED) {
+        msg.pow = Network.solvePoW(soul, this.network.POW_DIFFICULTY);
+      }
       // Byzantine resilience: attach sender (identity soul) + signature if identity is set
       if (this._identity) {
         msg.sender = this._identity.soul;
@@ -101,8 +146,11 @@ class Nevil {
     if (msg.lamportClock && msg.lamportClock > this._lamportClock) this._lamportClock = msg.lamportClock;
     this._suppressBroadcast = false;
     if (changed.length) {
-      // persist accepted remote writes too, so every peer's disk log is a full replica
-      this.storage.persist(msg.soul, msg.fields, msg.ts);
+      // persist accepted remote writes too, so every peer's disk log is a full replica,
+      // carrying each changed field's lamport clock so a future boot replays true causal order
+      const lamport = {};
+      for (const f of changed) lamport[f] = msg.lamportClock;
+      this.storage.persist(msg.soul, msg.fields, msg.ts, lamport);
     }
   }
 
@@ -112,6 +160,33 @@ class Nevil {
   put(soul, fields) {
     this.graph.put(soul, fields);
     return this;
+  }
+
+  /**
+   * Write multiple fields with a durability guarantee that a reader never
+   * observes a partially-persisted result after a crash: `put()` is
+   * already atomic in-memory (JS's single-threaded execution means no
+   * reader can observe a mid-batch state — verified via exec_js witness),
+   * but a process crash between the in-memory write and the async
+   * `storage.persist()` completing could leave some fields durable and
+   * others not if a caller made multiple separate `put()` calls. `putTxn`
+   * closes that gap for a single logical write: all fields land in ONE
+   * `put()` call (already atomic) plus a `_txnComplete` marker field, and
+   * `getTxn`/boot replay treat a node missing that marker as not-yet-
+   * visible (its fields are real on disk, but the caller's logical unit
+   * of work wasn't confirmed complete).
+   */
+  putTxn(soul, fields) {
+    this.graph.put(soul, { ...fields, _txnComplete: true });
+    return this;
+  }
+
+  /** Read a node written via putTxn(); returns undefined if the transaction marker is missing (crash left it partially visible from the caller's perspective, even though whatever fields did land are individually valid HAM state). */
+  getTxn(soul) {
+    const node = this.get(soul);
+    if (!node || node._txnComplete !== true) return undefined;
+    const { _txnComplete, ...fields } = node;
+    return fields;
   }
 
   /** Read the current value of a node. */
@@ -139,8 +214,9 @@ class Nevil {
     return isRef(v) ? this.get(v['#']) : v;
   }
 
-  async compact() {
-    await this.storage.compact(this.graph);
+  /** `{ purgeDeleted: true }` reclaims souls left fully null by delete() — see Storage.compact for the local-only semantics. */
+  async compact(opts = {}) {
+    await this.storage.compact(this.graph, opts);
   }
 
   // --- Soul indexing for range queries (optional) -------------------------
@@ -187,7 +263,7 @@ class Nevil {
    * Compatible with SQLite INSERT and GraphQL createX patterns.
    */
   insert(fields) {
-    const soul = require('crypto').randomUUID();
+    const soul = globalThis.crypto.randomUUID();
     this.put(soul, fields);
     return soul;
   }
@@ -233,7 +309,7 @@ class Nevil {
    */
   async createIdentity({ passphrase, alias } = {}) {
     if (passphrase) {
-      const seed = require('crypto').randomBytes(32);
+      const seed = Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(32)));
       return this.createIdentityFromSeed(seed, { passphrase, alias });
     }
 
@@ -319,15 +395,83 @@ class Nevil {
     return subSoul;
   }
 
-  /** Read + verify every signed field at a sub-address soul, given the claimed owner's soul. */
+  /**
+   * Publish the current identity's box (X25519) public key for a given
+   * sub-address path, so senders can seal messages for it. Returns hex.
+   * See keychain.js's module note: this is NOT derivable from the Ed25519
+   * soul alone by a third party — the scalar-holder must publish it once.
+   */
+  boxPublicKeyAt(path) {
+    if (!this._identity) throw new Error('no active identity — call createIdentityFromSeed or unlock first');
+    let chain = this._identity.keychain;
+    for (const label of path) chain = chain.sub(label);
+    return chain.get().toBoxPublicKey().toString('hex');
+  }
+
+  /**
+   * Write a sealed (confidentiality, not just signed) field to soul,
+   * addressed to a recipient's published box public key (hex, from
+   * `boxPublicKeyAt`/`toBoxPublicKey`). Only the recipient's matching
+   * scalar can decrypt; the graph/network only ever see ciphertext.
+   */
+  putEncrypted(soul, field, value, recipientBoxPublicKeyHex) {
+    const sealed = keychainEncryptFor(Buffer.from(recipientBoxPublicKeyHex, 'hex'), JSON.stringify(value));
+    this.put(soul, { [field]: sealed.toString('hex') });
+    return this;
+  }
+
+  /** Decrypt a sealed field written by putEncrypted, using the current identity's sub-address scalar at `path`. */
+  getDecryptedAt(path, soul, field) {
+    if (!this._identity) throw new Error('no active identity — call createIdentityFromSeed or unlock first');
+    let chain = this._identity.keychain;
+    for (const label of path) chain = chain.sub(label);
+    const node = this.get(soul);
+    if (!node || typeof node[field] !== 'string') return undefined; // no field, or not a sealed-hex string (never sealed at all)
+    try {
+      const opened = chain.get().decrypt(Buffer.from(node[field], 'hex'));
+      return JSON.parse(opened.toString());
+    } catch {
+      return undefined; // wrong recipient, corrupted ciphertext, or field was never actually sealed
+    }
+  }
+
+  /**
+   * Read + verify every signed field at a sub-address soul, including
+   * chain-of-custody: `_owner`/`_path` must be present, self-consistent
+   * (subSoul really is `owner.sub(...path)`, not just self-signed by
+   * whoever created the node), not merely that each field's signature
+   * verifies against the node's OWN public key. Without the custody
+   * check, an attacker can generate any keypair, self-sign an arbitrary
+   * `_owner`/`_path` claim, and getAtVerified would return it as if it
+   * were legitimately authored by that owner.
+   */
   getAtVerified(subSoul) {
     const node = this.get(subSoul);
     if (!node) return undefined;
-    const ownerKeyPair = new KeyPair({ publicKey: Buffer.from(subSoul, 'hex'), scalar: null });
+    const subKeyPair = new KeyPair({ publicKey: Buffer.from(subSoul, 'hex'), scalar: null });
+
+    if (!node._owner || !node._path) return undefined; // no custody claim at all — nothing to trust
+    const ownerOk = subKeyPair.verify(Buffer.from(JSON.stringify(node._owner.v)), Buffer.from(node._owner.sig, 'hex'));
+    const pathOk = subKeyPair.verify(Buffer.from(JSON.stringify(node._path.v)), Buffer.from(node._path.sig, 'hex'));
+    if (!ownerOk || !pathOk) return undefined;
+
+    // Recompute subSoul from the claimed owner + path (public-key-only
+    // derivation) and require it match the actual soul this node lives at —
+    // this is what proves subSoul was really derived from that owner, not
+    // just self-signed by an unrelated keypair.
+    let expectedChain;
+    try {
+      expectedChain = Keychain.fromPublicKey(node._owner.v);
+      for (const label of node._path.v) expectedChain = expectedChain.sub(label);
+    } catch {
+      return undefined; // malformed owner soul or path
+    }
+    if (expectedChain.get().toHex() !== subSoul) return undefined; // custody chain doesn't match — forged claim
+
     const out = {};
     for (const [k, v] of Object.entries(node)) {
       if (v && typeof v === 'object' && v.sig) {
-        const ok = ownerKeyPair.verify(Buffer.from(JSON.stringify(v.v)), Buffer.from(v.sig, 'hex'));
+        const ok = subKeyPair.verify(Buffer.from(JSON.stringify(v.v)), Buffer.from(v.sig, 'hex'));
         out[k] = ok ? v.v : undefined;
       }
     }
@@ -343,16 +487,26 @@ class Nevil {
     return Keychain;
   }
 
-  /** Batch write: atomically write multiple fields under a deterministically derived transaction ID. */
+  /**
+   * Write multiple fields under one labeled, signed sub-address so they
+   * can be read back together via `['txn', txnId]`. NOT a transaction in
+   * the ACID sense: `putAt` still merges fields independently (per-field
+   * eventual consistency, same as every other write in this system) —
+   * there is no isolation and no rollback on partial failure. The
+   * transaction id is deterministic (a hash of the fields + the next
+   * Lamport clock value), so identical calls always land at the same
+   * sub-address instead of the previous Math.random() nonce, which made
+   * two calls with the same options collide unpredictably or never
+   * collide when the caller actually wanted idempotent replay.
+   */
   async batchWrite(fields, options = {}) {
     if (!this._identity) throw new Error('batchWrite requires an identity (call createIdentity or unlock first)');
-    const { nonce = Math.random().toString(36).substring(7) } = options;
-    // Derive transaction ID: txnId = keychain.sub('txn').derive(nonce)
+    this._lamportClock++; // advance clock before deriving the nonce so it's part of the deterministic input
+    const nonce = options.nonce !== undefined
+      ? options.nonce
+      : Buffer.from(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(fields) + ':' + this._lamportClock))).toString('hex').slice(0, 16);
     const txnKeychain = this._identity.keychain.sub('txn').sub(nonce);
     const txnId = txnKeychain.head.publicKey.toString('hex');
-    // Increment Lamport clock for cross-batch ordering
-    this._lamportClock++;
-    // Write all fields atomically under ['txn', txnId] path with lamport clock
     const batchPath = ['txn', txnId];
     fields._lamportClock = this._lamportClock;
     return this.putAt(batchPath, fields);

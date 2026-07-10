@@ -118,34 +118,79 @@ class Storage {
   constructor(opts = {}) {
     if (isNode) {
       this.log = new NodeLogStore(opts.file || './nevil-data/log.ndjson');
+      this.reputationLog = new NodeLogStore(opts.reputationFile || './nevil-data/reputation.ndjson');
     } else {
       this.log = new BrowserLogStore(opts.dbName || 'nevil');
+      this.reputationLog = new BrowserLogStore(opts.reputationDbName || `${opts.dbName || 'nevil'}-reputation`);
     }
     this.index = opts.enableIndex ? new BTreeIndex(opts) : null;
   }
 
-  /** Replay the log into a fresh Graph on boot. */
-  async load(GraphClass) {
+  /**
+   * Replay the log into a fresh Graph on boot. Each entry replays with its
+   * OWN persisted lamportClock (when present) rather than omitting it —
+   * mergeNode only self-advances localClock past what it's given, so
+   * replaying N historical entries no longer inflates localClock to ~N;
+   * it converges on the true max clock seen across the log, exactly as if
+   * those writes were being received live. `graphOpts` carries the
+   * conflictResolution strategy (and any other Graph constructor option)
+   * so a rebooted graph keeps the same conflict strategy it was
+   * constructed with, not the class default.
+   */
+  async load(GraphClass, graphOpts) {
     const entries = await this.log.readAll();
-    const g = new GraphClass();
+    const g = new GraphClass(graphOpts);
     for (const entry of entries) {
-      g.mergeNode(entry.soul, entry.fields, entry.ts);
+      g.mergeNode(entry.soul, entry.fields, entry.ts, entry.lamportClock);
       if (this.index) this.index.add(entry.soul);
     }
     return g;
   }
 
-  /** Persist a batch of graph writes (called after every accepted merge). */
-  async persist(soul, fields, ts) {
-    await this.log.appendEntries([{ soul, fields, ts }]);
+  /** Persist a batch of graph writes (called after every accepted merge). Carries the field-level lamportClock map so a future boot replays real causal order, not a re-inflated local count. */
+  async persist(soul, fields, ts, lamportClock) {
+    await this.log.appendEntries([{ soul, fields, ts, lamportClock }]);
     if (this.index) this.index.add(soul);
   }
 
-  /** Rewrite the log to just the current graph state — call periodically. */
-  async compact(graph) {
+  /** Append one reputation-ledger entry ({peerId, delta, reason, timestamp}) to durable storage, so throttle/Byzantine state survives a restart instead of resetting every peer to neutral. */
+  async persistReputationEntry(entry) {
+    await this.reputationLog.appendEntries([entry]);
+  }
+
+  /** Replay the persisted reputation ledger — called on boot to rebuild Network's in-memory ledger/cache. */
+  async loadReputationLedger() {
+    return this.reputationLog.readAll();
+  }
+
+  /**
+   * Rewrite the log to just the current graph state — call periodically.
+   * Carries each field's persisted lamport clock (node.lamport) so
+   * compaction doesn't erase causal ordering on the next boot.
+   *
+   * `purgeDeleted: true` additionally reclaims souls that are fully
+   * tombstoned (every field null, as `nevil.delete()` leaves them) —
+   * without this, delete() only ever nulls fields; the soul and its
+   * history persist in the log and every replica forever. Purging drops
+   * the soul from the compacted log AND from the in-memory graph/index,
+   * so a later boot never sees it again. This is local-only: other peers
+   * that already replicated the tombstone keep it until they purge too.
+   */
+  async compact(graph, opts = {}) {
     const entries = [];
+    const purgedSouls = [];
     for (const [soul, node] of graph.nodes) {
-      entries.push({ soul, fields: node.data, ts: node.state });
+      const isFullyTombstoned = opts.purgeDeleted && Object.keys(node.data).length > 0
+        && Object.values(node.data).every((v) => v === null);
+      if (isFullyTombstoned) {
+        purgedSouls.push(soul);
+        continue;
+      }
+      entries.push({ soul, fields: node.data, ts: node.state, lamportClock: node.lamport });
+    }
+    for (const soul of purgedSouls) {
+      graph.nodes.delete(soul);
+      if (this.index) this.index.remove?.(soul);
     }
     await this.log.compact(entries);
     if (this.index) {

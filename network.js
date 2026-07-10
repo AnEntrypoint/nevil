@@ -77,6 +77,10 @@ class Network {
     this.QUEUE_RETRY_DELAY = opts.queueRetryDelay || 5000; // retry queued messages every 5s
     this.QUEUE_MAX_RETRIES = opts.queueMaxRetries || 5; // max retries before drop
 
+    // Proof-of-work rate-limiting (hashcash-style), optional, orthogonal to reputation
+    this.POW_ENABLED = opts.powEnabled === true; // default off — reputation ledger alone is the default throttle
+    this.POW_DIFFICULTY = opts.powDifficulty || 4; // leading hex zeros required
+
     if (isNode && this.opts.server) this._startServer();
     for (const url of this.opts.peers || []) this._dial(url);
   }
@@ -147,8 +151,14 @@ class Network {
         }
         lastClock.set(peerId, msg.lamportClock);
       }
-      // PoW verification: if message includes PoW, verify before relaying
-      if (msg.pow && !this._verifyPoW(msg.soul, msg.pow)) {
+      // PoW verification: when enabled, every write must carry a valid puzzle solution;
+      // when a puzzle is present regardless of the flag, verify it (never trust unchecked work).
+      if (this.POW_ENABLED && msg.type === 'put' && !this._verifyPoW(msg.soul, msg.pow)) {
+        this.metrics.powDropped = (this.metrics.powDropped || 0) + 1;
+        this.updateReputation(msg.sender || 'unknown', this.REP_DELTA_BYZANTINE, 'byzantine');
+        return; // missing or invalid PoW, drop and penalize sender
+      }
+      if (!this.POW_ENABLED && msg.pow && !this._verifyPoW(msg.soul, msg.pow)) {
         this.metrics.powDropped = (this.metrics.powDropped || 0) + 1;
         this.updateReputation(msg.sender || 'unknown', this.REP_DELTA_BYZANTINE, 'byzantine');
         return; // PoW failed, drop and penalize sender
@@ -231,11 +241,23 @@ class Network {
   _verifyPoW(soul, pow) {
     // Verify PoW: check that leading_zeros(sha256(soul || nonce)) >= difficulty
     if (!pow || typeof pow.nonce !== 'number' || typeof pow.difficulty !== 'number') return false;
+    if (pow.difficulty < this.POW_DIFFICULTY) return false; // can't satisfy the gate with a weaker puzzle
     const crypto = require('crypto');
     const input = soul + ':' + pow.nonce;
     const hash = crypto.createHash('sha256').update(input).digest('hex');
     const leadingZeros = hash.match(/^0*/)[0].length;
     return leadingZeros >= pow.difficulty;
+  }
+
+  /** Solve a hashcash-style puzzle for `soul` at `difficulty` leading hex zeros. O(16^difficulty) expected iterations. */
+  static solvePoW(soul, difficulty) {
+    const crypto = require('crypto');
+    let nonce = 0;
+    for (;;) {
+      const hash = crypto.createHash('sha256').update(soul + ':' + nonce).digest('hex');
+      if (hash.match(/^0*/)[0].length >= difficulty) return { nonce, difficulty };
+      nonce++;
+    }
   }
 
   _getPrefixMatches(soul, peers) {
@@ -320,6 +342,18 @@ class Network {
     const soul = msg.soul || msg.id;
     const connected = Array.from(this.sockets).map(ws => this._getPeerKey(ws));
     if (!soul || connected.length === 0) {
+      for (const pk of connected) selected.add(pk);
+      return selected;
+    }
+
+    // Bounded-subset routing is only meaningful for keychain-derived souls
+    // (they have a real geohash bucket to route within). For any other
+    // soul there is no bucket to narrow to, so DHT routing must flood-fill
+    // rather than silently truncate to the K+L healthiest peers — without
+    // this, _getPrefixMatches' own "non-keychain soul: flood-fill" intent
+    // never actually took effect, because useBucket below saw ALL peers as
+    // "matching" and picked only the top K+L of them with no fallback.
+    if (!this._isKeychainDerived(soul)) {
       for (const pk of connected) selected.add(pk);
       return selected;
     }
@@ -437,13 +471,29 @@ class Network {
     return this.reputationCache.get(peerId) || 0;
   }
 
-  /** Record reputation delta (append-only). Reasons: 'good', 'malformed', 'replay', 'byzantine', 'routing-help'. */
+  /**
+   * Record reputation delta (append-only). Reasons: 'good', 'malformed',
+   * 'replay', 'byzantine', 'routing-help'. When `onReputationDelta` is
+   * wired (see Nevil._boot), the entry is also durably persisted so a
+   * restart doesn't reset every peer's throttle/Byzantine state to
+   * neutral — without it the ledger is memory-only for this process.
+   */
   updateReputation(peerId, delta, reason = 'good') {
     const entry = { peerId, delta, reason, timestamp: Date.now() };
     this.reputationLedger.push(entry);
     const currentRep = this.reputationCache.get(peerId) || 0;
     this.reputationCache.set(peerId, currentRep + delta);
+    if (this.onReputationDelta) this.onReputationDelta(entry);
     return entry;
+  }
+
+  /** Replay a previously-persisted reputation ledger (called on boot before any live traffic). */
+  restoreReputationLedger(entries) {
+    for (const entry of entries) {
+      this.reputationLedger.push(entry);
+      const currentRep = this.reputationCache.get(entry.peerId) || 0;
+      this.reputationCache.set(entry.peerId, currentRep + entry.delta);
+    }
   }
 
   /** Get current reputation score (sum of all deltas). */

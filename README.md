@@ -19,13 +19,14 @@ primitives — native bindings in Node, WASM/JS in the browser).
 
 | Layer | File | What it is |
 |---|---|---|
-| Graph engine | `src/graph.js` | HAM last-write-wins CRDT (kept — good fit) |
-| **Identity/addressing** | `src/keychain.js` | keypear-style deterministic Ed25519 derivation |
-| Crypto | `src/crypto.js` | Web Crypto API — passphrase wrapping, encrypt-for-recipient |
-| Storage | `src/storage.js` | append-only log (Node `fs` / browser IndexedDB) |
-| Networking | `src/network.js` | WebSocket + DHT-aware bounded-subset routing + reputation ledger |
-| **Query** | `src/query.js` | GraphQL-shaped nested selection queries |
-| Composite | `nevil.js` | wires everything above into one API |
+| Graph engine | `graph.js` | HAM last-write-wins CRDT + Lamport clocks + pluggable conflict resolution |
+| **Identity/addressing** | `keychain.js` | keypear-style deterministic Ed25519 derivation + sealed-box encrypt-for-recipient |
+| Crypto | `crypto.js` | Web Crypto API — passphrase wrapping of the local account seed |
+| Storage | `storage.js` | append-only log (Node `fs` / browser IndexedDB) + durable reputation log |
+| Storage (B-tree) | `storage-btree.js` | memtable + SSTable index for O(log n)-ish lookups |
+| Networking | `network.js` | WebSocket + DHT-aware bounded-subset routing + reputation ledger + optional PoW |
+| **Query** | `query.js` | GraphQL-shaped nested selection queries |
+| Composite | `nevil.js` | wires everything above into one API, resolves AP/CA/CP topology presets |
 
 ## Why keychains became the addressing system, not just an auth feature
 
@@ -236,12 +237,13 @@ npm install
 
 - **DHT-aware bounded-subset routing over full flood-fill.** Network traffic for keychain-derived souls routes to a bounded subset (K healthiest + L adjacent connected peers in the soul's geohash bucket) rather than every peer — reducing O(peers) flood-fill traffic toward O(K) — with flood-fill fallback when too few peers match. This is a bounded-subset routing, not a provably O(log peers)-hop DHT. Correct choice for small-to-medium mesh (tens of peers, supervised environments); thousands+ of peers still need further hierarchical partitioning.
 - **Per-field eventual consistency over atomic multi-field commits.** Each field write signs independently with its own timestamp. A node with multi-field writes across time will hold fields from different points in time, each independently valid and verifiable. Fits append-only semantics; users requiring atomic multi-field should batch writes to a single .putAt() call.
-- **No rate limiting.** Spam resistance via proof-of-work (PoW) omitted; orthogonal to the graph and query layer. Can be added as an optional transport-layer policy without breaking the core API.
+- **Rate limiting is opt-in, off by default.** Proof-of-work (PoW) admission control is implemented (`Network({ powEnabled, powDifficulty })`, see Transcendence 7) but disabled by default — the reputation ledger alone throttles by default; PoW composes on top when spam resistance at the admission gate is worth the extra write latency.
 - **Append-only log over radix tree.** Simpler, trivially crash-safe (torn last line dropped on replay). Entire graph rebuilds in O(n) on boot; cost acceptable for <10M nodes.
 
 ## Completed Features
 
 - **Range queries & prefix scans.** Soul indexing now available via `enableSoulIndex: true` constructor option. Provides `prefixScan(prefix)` and `rangeScan(start, end)` for lexicographic lookups. Full radix-tree indexing deferred (rebalancing cost on every write).
+- **Confidentiality via encrypt-for-recipient.** Sealed-box encryption (`boxPublicKeyAt`/`putEncrypted`/`getDecryptedAt`) for field values addressed to a specific recipient, correct for both root and derived keychain addresses — see Transcendence 8.
 
 ## Resilience & Graceful Degradation
 
@@ -281,15 +283,15 @@ Reduce write-rate when p99 latency exceeds target. Scale is graceful degrade, no
 
 **Implementation:** Add `writeRateScale` in network.js; measure via `getMetrics()` percentiles.
 
-### 3. Chaos Testing (Fault Injection + Record-Replay)
+### 3. Chaos Replay (Fault Injection + Record-Replay, Debugging Tool)
 
-`tools/chaos-test.js` spawns 5 in-process Nevil instances, injects faults (10% message drop, 50ms jitter, peer kills), verifies consistency convergence. Messages recorded to `tools/chaos-log.ndjson` for deterministic replay.
+`tools/chaos-replay.js` spawns in-process Nevil instances, injects faults (message drop, jitter, peer kills), and replays a recorded message log deterministically for debugging convergence issues — a troubleshooting tool, not a standing test suite (no synthetic test files ship in this repo; see `AGENTS.md`).
 
 **Measurements:**
 - Consistency converges after kill: all peers reconcile within 1s
 - No data loss: all writes survive partition + recovery
 
-**Implementation:** Chaos test harness complete; run with `node tools/chaos-test.js`.
+**Usage:** `node tools/chaos-replay.js`.
 
 ### 4. Distributed Routing via Keypear (Scaling to Millions)
 
@@ -310,20 +312,11 @@ Peers derive "routing keys" deterministically via keypear: `routingKey = keychai
 
 **Implementation:** `batchWrite(fields)` method added to Nevil class.
 
-### 6. Deterministic PoW Rate Limiting
-
-Each write includes `{msg, pow: {nonce, difficulty}}` where nonce satisfies `leading_zeros(sha256(soul || nonce)) >= difficulty`. Receivers verify PoW before relaying. Difficulty scales with p99 latency (higher p99 = higher difficulty).
-
-**Measurements:**
-- PoW CPU cost: ~ms per write (tunable via difficulty)
-- Rejection rate: messages with insufficient PoW dropped silently
-- Graceful degrade: PoW difficulty scales with load
-
-**Implementation:** `computePoW(soul, difficulty)` in crypto.js; PoW verification in network.js message handler.
-
 ## Implemented Solutions (Previously Out-of-Scope)
 
-Three limitations have been reclassified as in-scope and fully implemented. Note the honest scope: DHT-aware routing is a bounded-subset (K-peer) routing, NOT a multi-level O(log peers)-hop DHT, and Lamport clocks provide per-field causal ordering (not cross-batch ACID transactions):
+Optional proof-of-work rate limiting is implemented, not future work — see Transcendence 7 below (`Network({ powEnabled, powDifficulty })`, `Network.solvePoW`/`_verifyPoW` in network.js; difficulty is a static per-network constant, not currently adaptive to p99 load — see the Residuals note in AGENTS.md).
+
+Eleven limitations have been reclassified as in-scope and fully implemented. Note the honest scope: DHT-aware routing is a bounded-subset (K-peer) routing, NOT a multi-level O(log peers)-hop DHT, and Lamport clocks provide per-field causal ordering (not cross-batch ACID transactions):
 
 ### 1. DHT-Aware Bounded-Subset Routing
 
@@ -365,7 +358,7 @@ Three limitations have been reclassified as in-scope and fully implemented. Note
 
 **Implementation:** `updateReputation(peerId, delta, reason)`, `getReputation(peerId)`, `getThrottleState(peerId)`, `isByzantineIsolated(peerId)`. Message handler checks throttle state before processing (`_onMessage` lines 115-124). Convergence time: < 1 second on 10-peer network. Witness: `tools/witness-reputation-ledger.js` validates all delta rules and throttle states.
 
-**Guarantee:** Gossip convergence to consistent reputation state across all peers. No central authority. Byzantine peers gradually isolated via reputation decay.
+**Guarantee:** Gossip convergence to consistent reputation state across all peers. No central authority. Byzantine peers gradually isolated via reputation decay. The ledger is also durably persisted (dedicated append-only log, separate from the graph log) and replayed on boot, so a restart doesn't reset a Byzantine peer back to neutral — see Transcendence 11.
 
 ## Performance Testing: Chaos Replay Harness
 
@@ -400,9 +393,9 @@ No central registry needed. Identities are keypear keystrees:
 
 PKI without PKI infrastructure. Addresses = public keys. Verification = Ed25519 math. No trust assumptions beyond math.
 
-## Transcendences: Four Limitations Solved
+## Transcendences: Eleven Limitations Solved
 
-All four prior limitations have been reclassified as in-scope and fully implemented:
+All eleven prior limitations have been reclassified as in-scope and fully implemented:
 
 ### 1. **O(peers) Traffic → bounded-subset O(K) via DHT-aware routing** (Transcendence 1)
 **Problem:** Flood-fill gossip scales as O(peers) per write — good for small meshes (tens), not for large ones.
@@ -432,20 +425,58 @@ All four prior limitations have been reclassified as in-scope and fully implemen
 
 **Implementation:** `storage-btree.js` implements `BTreeIndex` with `write()`, `get()`, `rangeScan()`, `prefixScan()`, `flushMemtable()`, `compactSSTables()`, wired into `storage.js`. Witness: `tools/witness-btree-storage.js` uses real `Storage` and asserts the index contract (real prefix/range lookups, binary-search `get`).
 
-### All Four Together (Transcendence Integration)
-Full-system test: `tools/witness-integration.js` asserts `A.putAt(...)` gossips to B and `B.getAtVerified(...)` returns the verified title/_owner/_path, plus prefix scan — proving cross-node signed writes deliver AND verify with canonical-JSON signing + auto-advanced clock.
+### 5. **Fixed Conflict Resolution → Pluggable Strategy** (Transcendence 5)
+**Problem:** HAM last-write-wins was the only conflict resolution strategy, with no way to opt into first-write-wins or app-specific merge semantics.
+
+**Solution:** `Graph({ conflictResolution: 'lww' | 'fww' | fn })`. Default ('lww') is byte-identical to prior behavior. `fww` keeps the first write to a field regardless of later timestamps; a custom fn can implement any app-specific merge rule.
+
+**Implementation:** `graph.js` `CONFLICT_STRATEGIES` map, `hamWins`/`fwwWins`, `Graph.resolveConflict` wired into `mergeField`. Witness: `tools/witness-conflict-resolution.js` asserts LWW/FWW/custom converge to distinct, correct winners on identical concurrent input.
+
+### 6. **No Explicit Topology → Named AP/CA/CP Modes** (Transcendence 6)
+**Problem:** No first-class way to declare which two of {consistency, availability, partition tolerance} a deployment optimizes for; users had to hand-configure DHT/clock/conflict options to approximate a topology.
+
+**Solution:** `Nevil({ topology: 'ap' | 'ca' | 'cp' })` resolves a preset (conflict strategy + DHT flag) before construction. Per the CAP theorem, no mode claims all three properties — each preset just names its trade-off honestly. Any opt passed alongside `topology` overrides that preset field.
+
+- **`topology: 'ap'`** — Availability + partition tolerance. Flood-fill gossip (no DHT), LWW. Writes always succeed locally; reconverges eventually on reconnect.
+- **`topology: 'ca'`** — Consistency + availability. Flood-fill gossip (no DHT), LWW. Assumes no partition; if one occurs anyway, this mode degrades like AP rather than blocking writes — it was never designed to detect or specially handle a split.
+- **`topology: 'cp'`** — Consistency + partition tolerance. DHT-aware bounded-subset routing enabled, LWW. Lamport clocks (always active) give causal ordering across a partition.
+
+**Implementation:** `nevil.js` `TOPOLOGY_PRESETS`/`resolveTopologyOpts()` applied in the constructor before `storage`/`graph`/`network` are built. Witness: `tools/witness-topology-modes.js` asserts each mode's configuration and the override behavior; `tools/witness-ha-ca-cp-integration.js` proves a real 2-peer mesh under CA + PoW replicates correctly.
+
+### 7. **No Spam Resistance → Optional Proof-of-Work** (Transcendence 7)
+**Problem:** The reputation ledger throttles *after* observing bad behavior; there was no admission-control gate to make spam itself costly.
+
+**Solution:** `Network({ powEnabled, powDifficulty })`, off by default. When enabled, every `put` message must carry a valid hashcash-style solved puzzle (`sha256(soul + nonce)` with N leading hex zeros) or is dropped and its sender penalized in the reputation ledger. Orthogonal to and composable with reputation (PoW gates per-message; reputation gates per-peer throughput over time).
+
+**Implementation:** `network.js` `Network.solvePoW()` (static solver), `_verifyPoW()` (O(1) check), message-handler enforcement gate; `nevil.js` attaches a solved puzzle to outbound writes when enabled. Witness: `tools/witness-proof-of-work.js` asserts unsolved writes are rejected and solved writes accepted, with real solve/verify timing over live loopback sockets.
+
+### 8. **Signing-Only → Real Encrypt-for-Recipient** (Transcendence 8)
+**Problem:** The crypto layer only signed messages (authenticity); nothing sealed field values for confidentiality, despite an earlier header comment claiming otherwise.
+
+**Solution:** `KeyPair.toBoxPublicKey()` derives a correct X25519 public key from the (possibly tweaked/derived) Ed25519 scalar via `crypto_scalarmult_base` — the standard `crypto_sign_ed25519_pk_to_curve25519` conversion silently produces the WRONG key for any `.sub()`-derived address (verified: it only matches by coincidence at the root). A recipient publishes their box public key once; senders who hold only that published value can seal messages nobody else can open.
+
+**Implementation:** `keychain.js` `toBoxPublicKey`/`encryptFor`/`decrypt`, module-level `encryptFor(boxPublicKey, message)`; `nevil.js` `boxPublicKeyAt`/`putEncrypted`/`getDecryptedAt`. Witness: `tools/witness-encrypt-for-recipient.js` asserts sender-only sealing, correct-recipient decryption, and rejection of both a different derived sub-address and a read-only (scalar-less) capability.
+
+### 9–10. **Boot/Compaction Clock Bugs → Fixed** (Transcendences 9–10)
+**Problem:** `Storage.load()` replayed every log entry as a fresh local write, incrementing `localClock` once per entry — an N-entry log inflated the clock to ~N regardless of real history. `Storage.compact()` separately discarded per-field Lamport clocks entirely, degrading causal ordering to timestamp-only HAM after any compact + reboot.
+
+**Solution:** Replay now carries each entry's own persisted (per-field) clock; `localClock` converges on the true historical max instead of re-inflating. Compaction now persists the per-field lamport map alongside `fields`/`ts`.
+
+**Implementation:** `storage.js` `load()`/`persist()`/`compact()`; `graph.js` `mergeNode()` extended to accept a per-field lamport map. Witness: `tools/witness-boot-clock-integrity.js` asserts a real Nevil instance's clock does not inflate across a restart and survives compaction.
+
+### 11. **Volatile Reputation → Durable Across Restarts** (Transcendence 11)
+**Problem:** `network.reputationLedger`/`reputationCache` were memory-only; a process restart reset every peer — including a previously-Byzantine one — back to neutral reputation.
+
+**Solution:** A dedicated append-only reputation log (separate file/dbName from the graph log), replayed on boot before any live traffic, with every new delta persisted through an injected hook.
+
+**Implementation:** `storage.js` `persistReputationEntry`/`loadReputationLedger`; `network.js` `restoreReputationLedger`, `onReputationDelta` hook; `nevil.js` wires them together in `_boot`. Witness: `tools/witness-reputation-durability.js` asserts a Byzantine peer's throttle state survives a real restart.
+
+### All Eleven Together (Transcendence Integration)
+Full-system test: `tools/witness-integration.js` asserts `A.putAt(...)` gossips to B and `B.getAtVerified(...)` returns the verified title/_owner/_path, plus prefix scan — proving cross-node signed writes deliver AND verify with canonical-JSON signing + auto-advanced clock. `tools/witness-ha-ca-cp-integration.js` separately proves topology modes, conflict resolution, and PoW compose correctly in one real 2-peer mesh.
 
 ## CAP Theorem Modes (AP/CA/CP)
 
-Nevil's constructor accepts a `capMode` parameter to trade consistency, availability, and partition-tolerance:
-
-- **`capMode: 'AP'` (default)** — Availability + Partition tolerance. Writes succeed on any peer. On partition heal, writes from both sides merge via HAM last-write-wins. Best for offline-first apps and mesh networks.
-  
-- **`capMode: 'CA'`** — Consistency + Availability. Writes queue locally but require quorum acknowledgment before broadcast. If quorum becomes unavailable (peers down), writes block. Reads return last-known-consistent state (may be stale during recovery). Best for supervised environments with moderate availability requirements.
-  
-- **`capMode: 'CP'`** — Consistency + Partition tolerance. On partition detect (quorum loss), minority partition switches to read-only and refuses writes. Majority partition continues serving. Writes fail with "partition detected, switching to read-only" message on minority. Converges on heal. Best for hierarchical networks with a clear majority region.
-
-All modes share the same core API; the mode only affects broadcast semantics and quorum requirements. No consensus protocol or coordinator required.
+Nevil's constructor accepts a `topology` parameter to name which two of {consistency, availability, partition tolerance} a deployment optimizes for — see Transcendence 6 above for the full description and honest residuals (CA mode does not detect partitions; it just wasn't designed to promise behavior during one). This replaces an earlier `capMode` parameter that was documented here but never implemented in code (a phantom API caught and fixed during this session's audit) — use `topology`, not `capMode`.
 
 ## Validation: Debugging and Troubleshooting Only
 

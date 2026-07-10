@@ -52,7 +52,20 @@
  * implementations failed to interoperate), this module calls the real
  * extension functions via `sodium-universal` -- Holepunch's own
  * isomorphic wrapper (native bindings in Node, WASM/JS in the browser).
- * Verified byte-for-byte against `keypear` directly; see test/keychain.test.js.
+ * Verified byte-for-byte against `keypear` directly (audited via exec_js
+ * witness, not a standing test file).
+ *
+ * ENCRYPT-FOR-RECIPIENT: the tweaked Ed25519 scalar this module derives is
+ * NOT interchangeable with `crypto_sign_ed25519_pk_to_curve25519` for a
+ * derived (non-root) key -- that conversion assumes a standard RFC 8032
+ * seed-expanded secret key, and point-addition tweaking does not preserve
+ * the sign-bit relationship it depends on (verified: they diverge for any
+ * `.sub()`-derived key, matching only coincidentally at the root). The
+ * correct primitive is `crypto_scalarmult_base(scalar)`, which is exact
+ * for every scalar, tweaked or not: a writable KeyPair derives and
+ * publishes its OWN X25519 public key via `toBoxPublicKey()`; senders
+ * seal messages against that published value, never by converting the
+ * Ed25519 public key directly.
  */
 
 'use strict';
@@ -90,6 +103,40 @@ class KeyPair {
   }
 
   /**
+   * This keypair's X25519 public key, for sealed-box encryption-for-recipient.
+   * Must be derived from the SCALAR (via crypto_scalarmult_base), not from
+   * the Ed25519 public key -- see the module-level note on why. Requires
+   * the scalar (writable keypair); a read-only capability cannot publish
+   * this on the holder's behalf, only the scalar-holder can.
+   */
+  toBoxPublicKey() {
+    if (!this.writable) throw new Error('cannot derive box public key: this is a public-key-only (readonly) keypair');
+    const xpk = Buffer.alloc(sodium.crypto_box_PUBLICKEYBYTES);
+    sodium.crypto_scalarmult_base(xpk, this.scalar);
+    return xpk;
+  }
+
+  /** Seal a message for this keypair's own published box public key (anyone can call this with just the pubkey; convenience when you already hold the writable pair). */
+  encryptFor(message) {
+    const xpk = this.toBoxPublicKey();
+    const pt = toBuf(message);
+    const sealed = Buffer.alloc(pt.length + sodium.crypto_box_SEALBYTES);
+    sodium.crypto_box_seal(sealed, pt, xpk);
+    return sealed;
+  }
+
+  /** Open a sealed-box message addressed to this keypair. Throws if this is read-only or the seal doesn't verify. */
+  decrypt(sealed) {
+    if (!this.writable) throw new Error('cannot decrypt: this is a public-key-only (readonly) keypair');
+    const xpk = this.toBoxPublicKey();
+    const ct = toBuf(sealed);
+    const pt = Buffer.alloc(ct.length - sodium.crypto_box_SEALBYTES);
+    const ok = sodium.crypto_box_seal_open(pt, ct, xpk, this.scalar);
+    if (!ok) throw new Error('decryption failed: not sealed for this keypair, or corrupted');
+    return pt;
+  }
+
+  /**
    * Derive a child KeyPair from this one and a label (Buffer/string).
    * Mirrors keypear's `_getTweak` + `add`: tweak = blake2b(thisPublicKey
    * || label), then
@@ -109,6 +156,19 @@ class KeyPair {
   toHex() {
     return this.publicKey.toString('hex');
   }
+}
+
+/**
+ * Sender-side sealed-box encryption against a recipient's PUBLISHED X25519
+ * public key (the output of `recipientKeyPair.toBoxPublicKey()`) -- the
+ * sender never needs the recipient's Ed25519 public key or scalar for this.
+ */
+function encryptFor(boxPublicKey, message) {
+  const xpk = toBuf(boxPublicKey);
+  const pt = toBuf(message);
+  const sealed = Buffer.alloc(pt.length + sodium.crypto_box_SEALBYTES);
+  sodium.crypto_box_seal(sealed, pt, xpk);
+  return sealed;
 }
 
 /** tweak = blake2b(parentPublicKey || label) -> (tweakScalar, tweakPublicKey), exactly as keypear computes it. */
@@ -249,4 +309,4 @@ class Keychain {
   }
 }
 
-module.exports = { Keychain, KeyPair };
+module.exports = { Keychain, KeyPair, encryptFor };

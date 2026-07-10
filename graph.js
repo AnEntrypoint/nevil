@@ -58,6 +58,17 @@ function hamWins(incomingTs, incomingVal, currentTs, currentVal, incomingLamport
   return canonicalValue(incomingVal) > canonicalValue(currentVal);
 }
 
+/** First-write-wins: incoming only wins if there is no current value at all. */
+function fwwWins(incomingTs, incomingVal, currentTs, currentVal) {
+  return currentTs === undefined;
+}
+
+/** Named strategies pluggable into Graph({ conflictResolution }). */
+const CONFLICT_STRATEGIES = {
+  lww: hamWins,
+  fww: fwwWins,
+};
+
 class Graph {
   constructor(opts = {}) {
     // soul -> { field: value, ..., _meta: { field: { state: ts } } }
@@ -71,6 +82,12 @@ class Graph {
     this.CLOCK_MAX_JUMP = opts.clockMaxJump || 1000; // max clock steps ahead
     this.CLOCK_FAST_THRESHOLD = opts.clockFastThreshold || 1000; // steps/sec for Byzantine detection
     this.peerClocks = new Map(); // peerId -> lastClock seen (for replay detection)
+
+    // Conflict resolution strategy: 'lww' (default), 'fww', or a custom
+    // fn(incomingTs, incomingVal, currentTs, currentVal, incomingLamport, currentLamport) -> boolean
+    const strategy = opts.conflictResolution || 'lww';
+    this.resolveConflict = typeof strategy === 'function' ? strategy : CONFLICT_STRATEGIES[strategy];
+    if (!this.resolveConflict) throw new Error(`unknown conflictResolution strategy: ${strategy}`);
   }
 
   _ensureNode(soul) {
@@ -89,7 +106,7 @@ class Graph {
     const currentTs = node.state[field];
     const currentVal = node.data[field];
 
-    if (!hamWins(ts, value, currentTs, currentVal, incomingLamport, currentLamport)) {
+    if (!this.resolveConflict(ts, value, currentTs, currentVal, incomingLamport, currentLamport)) {
       return false; // stale write, drop it — this is how eventual consistency works
     }
 
@@ -102,23 +119,31 @@ class Graph {
   /**
    * Merge a whole node-shaped patch: { soul, field: value, ... } plus a
    * parallel timestamp map. This is the unit that gets sent over the wire
-   * and written to the storage log. Optional lamportClock for external messages;
-   * when omitted the merge is a local write clocked with the next local Lamport.
+   * and written to the storage log. `lamportClock` is either a single
+   * scalar applied to every field in this batch (the live network/local-
+   * write path), a per-field map matching `timestamps`'s shape (the replay
+   * path — storage persists/compacts node.lamport per field, since
+   * different fields on the same soul can carry different historical
+   * clocks), or omitted for a local write clocked with the next local
+   * Lamport value.
    */
   mergeNode(soul, fields, timestamps, lamportClock) {
-    let incomingClock;
-    if (lamportClock !== undefined) {
+    const perField = lamportClock !== null && typeof lamportClock === 'object';
+    let batchClock;
+    if (!perField && lamportClock !== undefined) {
       if (lamportClock > this.localClock) this.localClock = lamportClock;
       this.localClock++; // increment after receiving external message
-      incomingClock = lamportClock;
-    } else {
+      batchClock = lamportClock;
+    } else if (!perField) {
       this.localClock++; // local write advances the local clock
-      incomingClock = this.localClock;
+      batchClock = this.localClock;
     }
 
     const changed = [];
     for (const field of Object.keys(fields)) {
       const ts = timestamps[field];
+      const incomingClock = perField ? lamportClock[field] : batchClock;
+      if (perField && incomingClock !== undefined && incomingClock > this.localClock) this.localClock = incomingClock;
       const currentLamport = this.nodes.get(soul)?.lamport[field];
       if (this.mergeField(soul, field, fields[field], ts, incomingClock, currentLamport)) {
         changed.push(field);
@@ -186,4 +211,4 @@ class Graph {
   }
 }
 
-module.exports = { Graph, isRef, ref, hamWins, REF };
+module.exports = { Graph, isRef, ref, hamWins, fwwWins, CONFLICT_STRATEGIES, REF };
