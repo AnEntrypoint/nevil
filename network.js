@@ -48,7 +48,8 @@ class Network {
     this.peerHealthScores = new Map(); // peerId -> {latency, loss, lastSeen}
     this.peerRoutingKeys = new Map(); // peerKey -> routing prefix (learned), unknown = include all
     this.dialedUrls = new Set(this.opts.peers || []); // urls we dialed (vs server-attached)
-    this.reputationLedger = []; // append-only: {peerId, delta, reason, ts}
+    this.reputationLedger = []; // bounded: {peerId, delta, reason, ts}
+    this.maxReputationLedger = opts.maxReputationLedger || 20000; // FIFO cap on in-memory ledger (durable log is unaffected, see storage.js)
     this.reputationCache = new Map(); // peerId -> total reputation sum (sum of all deltas)
     this.messageQueue = []; // messages queued from throttled peers
 
@@ -124,7 +125,7 @@ class Network {
       }
     };
     const handleMessage = (raw) => {
-      const recvStart = Date.now() + Math.random() / 1000;
+      const recvStart = Date.now();
       let msg;
       try {
         msg = JSON.parse(typeof raw === 'string' ? raw : raw.data ?? raw.toString());
@@ -132,24 +133,41 @@ class Network {
         this.updateReputation(this._getPeerKey(ws), this.REP_DELTA_MALFORMED, 'malformed');
         return; // malformed frame, drop and penalize sender
       }
-      if (!msg.id || !this._remember(msg.id)) return; // already seen, stop the flood here
+      // A parsed primitive/null/array is not a valid message envelope — field
+      // access below (msg.id, msg.sender, ...) would throw uncaught otherwise.
+      if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) {
+        this.updateReputation(this._getPeerKey(ws), this.REP_DELTA_MALFORMED, 'malformed');
+        return;
+      }
+      // Cap id length: an unbounded attacker-controlled id string can bloat
+      // `seen`/`seenOrder` memory even though entry COUNT is bounded by maxSeen.
+      if (typeof msg.id !== 'string' || msg.id.length === 0 || msg.id.length > 256) {
+        this.updateReputation(this._getPeerKey(ws), this.REP_DELTA_MALFORMED, 'malformed');
+        return;
+      }
+      if (!this._remember(msg.id)) return; // already seen, stop the flood here
       // Signature verification: keypear-derived sender authenticity
       if (msg.sender && msg.signature && !this._verifySignature(msg.sender, msg, msg.signature)) {
         this.metrics.signatureDropped = (this.metrics.signatureDropped || 0) + 1;
         this.updateReputation(msg.sender, this.REP_DELTA_BYZANTINE, 'byzantine');
         return; // signature failed, drop and penalize sender
       }
-      // Lamport clock gate: reject out-of-order or rollback clocks
+      // Lamport clock gate: reject out-of-order or rollback clocks. Keyed per
+      // CONNECTION (peerKey), not per claimed `msg.sender` — an unauthenticated
+      // sender field is attacker-controlled, so bucketing by it (or by a shared
+      // 'unknown' string when omitted) let any anonymous peer manipulate a
+      // shared counter to block others. Per-socket tracking means an attacker
+      // can only ever race against their own connection's prior clock.
       if (msg.lamportClock !== undefined) {
-        const peerId = msg.sender || 'unknown';
+        const connKey = this._getPeerKey(ws);
         const lastClock = this.peerClocks = this.peerClocks || new Map();
-        const prior = lastClock.get(peerId) || 0;
+        const prior = lastClock.get(connKey) || 0;
         if (msg.lamportClock <= prior) {
           this.metrics.clockDropped = (this.metrics.clockDropped || 0) + 1;
-          this.updateReputation(peerId, this.REP_DELTA_REPLAY, 'replay');
+          this.updateReputation(msg.sender || connKey, this.REP_DELTA_REPLAY, 'replay');
           return; // clock did not advance, possible replay/rollback
         }
-        lastClock.set(peerId, msg.lamportClock);
+        lastClock.set(connKey, msg.lamportClock);
       }
       // PoW verification: when enabled, every write must carry a valid puzzle solution;
       // when a puzzle is present regardless of the flag, verify it (never trust unchecked work).
@@ -185,7 +203,7 @@ class Network {
       }
       // throttleState === 'accept': process normally
       this.metrics.messagesReceived++;
-      const recvMs = Date.now() + Math.random() / 1000 - recvStart;
+      const recvMs = Date.now() - recvStart;
       this._recordLatency('receive_ms', recvMs);
       this.updatePeerHealth(this._getPeerKey(ws), recvMs, 0);
       this.onMessage(msg);
@@ -287,7 +305,7 @@ class Network {
   }
 
   _relay(msg, exceptSocket) {
-    const sendStart = Date.now() + Math.random() / 1000;
+    const sendStart = Date.now();
     const data = JSON.stringify(msg);
     // Update adaptive backpressure before relay
     this._updateBackpressure();
@@ -299,7 +317,7 @@ class Network {
       if (ws === exceptSocket) continue;
       // Only send if peer is in target list (DHT-routed)
       const peerKey = this._getPeerKey(ws);
-      if (!targetPeers.has(peerKey) && this.opts.dhtEnabled !== false) continue;
+      if (!targetPeers.has(peerKey) && this.DHT_ENABLED) continue;
 
       const state = isNode ? ws.readyState : ws.readyState;
       if (state === 1 /* OPEN */) {
@@ -307,7 +325,7 @@ class Network {
           ws.send(data);
           this.metrics.messagesSent++;
           this.metrics.bytesSent += data.length;
-          const sendMs = Date.now() + Math.random() / 1000 - sendStart;
+          const sendMs = Date.now() - sendStart;
           this._recordLatency('send_ms', sendMs);
         } catch {
           // dead socket, will be cleaned up by its own close handler
@@ -334,7 +352,7 @@ class Network {
     const selected = new Set();
 
     // DHT disabled: pure flood-fill to all connected peers.
-    if (this.opts.dhtEnabled === false) {
+    if (!this.DHT_ENABLED) {
       for (const ws of this.sockets) selected.add(this._getPeerKey(ws));
       return selected;
     }
@@ -387,13 +405,15 @@ class Network {
     if (this._isKeychainDerived(soul)) {
       return soul.substring(0, 4);
     }
-    // Fallback: simple string hash
-    let hash = 0;
-    for (let i = 0; i < Math.min(soul.length, 4); i++) {
-      hash = ((hash << 5) - hash) + soul.charCodeAt(i);
-      hash |= 0; // convert to int
+    // Fallback: FNV-1a over the FULL soul (not just its first 4 chars) —
+    // hashing only a short prefix meant distinct souls sharing that prefix
+    // collided into the same bucket regardless of the rest of the string.
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < soul.length; i++) {
+      hash ^= soul.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193);
     }
-    return (hash >>> 0).toString(16).substring(0, 4);
+    return (hash >>> 0).toString(16).padStart(8, '0').substring(0, 4);
   }
 
   _recordLatency(op, ms) {
@@ -441,12 +461,19 @@ class Network {
     );
   }
 
-  /** Update peer health score (latency + loss rate). */
+  /**
+   * Update peer health score (latency + loss rate) via a bounded moving
+   * average. `count` is capped at HEALTH_AVERAGE_WINDOW so a long-lived
+   * peer's score stays responsive to recent behavior instead of becoming
+   * increasingly resistant to change the longer the connection has lived.
+   */
   updatePeerHealth(peerId, latency, loss = 0) {
+    const window = this.opts.dhtHealthAverageWindow || 100;
     const existing = this.peerHealthScores.get(peerId) || { latency: 0, loss: 0, count: 0 };
-    existing.latency = (existing.latency * existing.count + latency) / (existing.count + 1);
-    existing.loss = (existing.loss * existing.count + loss) / (existing.count + 1);
-    existing.count++;
+    const n = Math.min(existing.count, window);
+    existing.latency = (existing.latency * n + latency) / (n + 1);
+    existing.loss = (existing.loss * n + loss) / (n + 1);
+    existing.count = Math.min(existing.count + 1, window);
     existing.lastSeen = Date.now();
     this.peerHealthScores.set(peerId, existing);
   }
@@ -481,6 +508,7 @@ class Network {
   updateReputation(peerId, delta, reason = 'good') {
     const entry = { peerId, delta, reason, timestamp: Date.now() };
     this.reputationLedger.push(entry);
+    if (this.reputationLedger.length > this.maxReputationLedger) this.reputationLedger.shift();
     const currentRep = this.reputationCache.get(peerId) || 0;
     this.reputationCache.set(peerId, currentRep + delta);
     if (this.onReputationDelta) this.onReputationDelta(entry);
@@ -491,6 +519,7 @@ class Network {
   restoreReputationLedger(entries) {
     for (const entry of entries) {
       this.reputationLedger.push(entry);
+      if (this.reputationLedger.length > this.maxReputationLedger) this.reputationLedger.shift();
       const currentRep = this.reputationCache.get(entry.peerId) || 0;
       this.reputationCache.set(entry.peerId, currentRep + entry.delta);
     }

@@ -157,8 +157,14 @@ class BTreeIndex {
 
   /** Prefix scan: return [soul, entry] pairs for souls starting with prefix. */
   prefixScan(prefix) {
-    const end = prefix + '￿';
-    return this._collectPairs(prefix, end);
+    // '￿' as an upper bound mis-includes/excludes souls containing
+    // supplementary-plane (astral) characters, since those encode as
+    // surrogate pairs that can compare above or below it depending on the
+    // leading surrogate's code unit. Filtering by startsWith is exact for
+    // any Unicode content, at the cost of a linear scan over the range
+    // collected by a (still efficient) '￿'-bounded pre-filter.
+    const end = prefix + '￿￿';
+    return this._collectPairs(prefix, end).filter(([soul]) => soul.startsWith(prefix));
   }
 
   /** Prefix match: return sorted soul strings starting with prefix. */
@@ -197,7 +203,8 @@ class BTreeIndex {
     const sorted = Array.from(merged.entries())
       .sort((a, b) => a[0].localeCompare(b[0]));
 
-    this.sstables.splice(idx1, 2, {
+    this.sstables.splice(idx1, 2);
+    this._insertSSTable({
       index: new Map(sorted),
       minSoul: sorted[0][0],
       maxSoul: sorted[sorted.length - 1][0],

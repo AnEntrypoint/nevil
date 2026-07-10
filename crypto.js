@@ -15,6 +15,12 @@
 
 const subtle = globalThis.crypto.subtle;
 
+// btoa/atob exist in browsers; polyfill minimally for Node. Declared before
+// toB64/fromB64 (which close over them) so there is no temporal-dead-zone
+// hazard if either is ever called during module load, not just after.
+const btoa = globalThis.btoa || ((s) => Buffer.from(s, 'binary').toString('base64'));
+const atob = globalThis.atob || ((s) => Buffer.from(s, 'base64').toString('binary'));
+
 function toB64(buf) {
   const bytes = new Uint8Array(buf);
   let bin = '';
@@ -31,12 +37,11 @@ function fromB64(str) {
   return bytes.buffer;
 }
 
-// btoa/atob exist in browsers; polyfill minimally for Node.
-const btoa = globalThis.btoa || ((s) => Buffer.from(s, 'binary').toString('base64'));
-const atob = globalThis.atob || ((s) => Buffer.from(s, 'base64').toString('binary'));
-
 /** Symmetric encrypt with a passphrase-derived key (PBKDF2 -> AES-GCM). Used for local account secrets. */
 async function encryptWithPass(data, passphrase, saltB64) {
+  if (typeof passphrase !== 'string' || passphrase.length === 0) {
+    throw new Error('passphrase must be a non-empty string');
+  }
   const salt = saltB64 ? fromB64(saltB64) : globalThis.crypto.getRandomValues(new Uint8Array(16));
   const baseKey = await subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
   const key = await subtle.deriveKey(
@@ -53,6 +58,12 @@ async function encryptWithPass(data, passphrase, saltB64) {
 }
 
 async function decryptWithPass(payload, passphrase) {
+  if (typeof passphrase !== 'string' || passphrase.length === 0) {
+    throw new Error('passphrase must be a non-empty string');
+  }
+  if (!payload || typeof payload !== 'object' || typeof payload.salt !== 'string' || typeof payload.iv !== 'string' || typeof payload.ct !== 'string') {
+    throw new Error('corrupt or malformed sealed payload: expected {salt, iv, ct} base64url strings');
+  }
   const salt = fromB64(payload.salt);
   const baseKey = await subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
   const key = await subtle.deriveKey(

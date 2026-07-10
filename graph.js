@@ -21,7 +21,9 @@ const REF = '#'; // key used inside a value to mark it as a soul-reference
 
 /** True if `v` is a soul-reference ({ '#': 'someSoul' }) rather than a plain value. */
 function isRef(v) {
-  return v !== null && typeof v === 'object' && typeof v[REF] === 'string' && Object.keys(v).length === 1;
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return false;
+  if (!Object.prototype.hasOwnProperty.call(v, REF)) return false;
+  return typeof v[REF] === 'string' && Object.keys(v).length === 1;
 }
 
 function ref(soul) {
@@ -82,6 +84,7 @@ class Graph {
     this.CLOCK_MAX_JUMP = opts.clockMaxJump || 1000; // max clock steps ahead
     this.CLOCK_FAST_THRESHOLD = opts.clockFastThreshold || 1000; // steps/sec for Byzantine detection
     this.peerClocks = new Map(); // peerId -> lastClock seen (for replay detection)
+    this.MAX_FIELDS_PER_NODE = opts.maxFieldsPerNode || 1000; // caps synchronous per-message work
 
     // Conflict resolution strategy: 'lww' (default), 'fww', or a custom
     // fn(incomingTs, incomingVal, currentTs, currentVal, incomingLamport, currentLamport) -> boolean
@@ -128,6 +131,10 @@ class Graph {
    * Lamport value.
    */
   mergeNode(soul, fields, timestamps, lamportClock) {
+    if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) return [];
+    if (timestamps === null || typeof timestamps !== 'object' || Array.isArray(timestamps)) return [];
+    const fieldNames = Object.keys(fields);
+    if (fieldNames.length > this.MAX_FIELDS_PER_NODE) return [];
     const perField = lamportClock !== null && typeof lamportClock === 'object';
     let batchClock;
     if (!perField && lamportClock !== undefined) {
@@ -140,7 +147,7 @@ class Graph {
     }
 
     const changed = [];
-    for (const field of Object.keys(fields)) {
+    for (const field of fieldNames) {
       const ts = timestamps[field];
       const incomingClock = perField ? lamportClock[field] : batchClock;
       if (perField && incomingClock !== undefined && incomingClock > this.localClock) this.localClock = incomingClock;
@@ -153,9 +160,13 @@ class Graph {
     return changed;
   }
 
-  /** Convenience for local writes: stamps every field with now() and advances localClock via mergeNode. */
+  /** Convenience for local writes: stamps every field with a monotonic ts and advances localClock via mergeNode. */
   put(soul, fields) {
-    const now = Date.now() + Math.random() / 1000; // sub-ms jitter avoids same-ms tie floods
+    // Monotonic within-process: real ties are broken by the Lamport clock (mergeNode
+    // advances localClock on every local write), so this ts only needs to never repeat
+    // or go backwards locally — Date.now() alone can repeat under tight-loop writes.
+    this._lastPutTs = Math.max(Date.now(), (this._lastPutTs || 0) + 0.001);
+    const now = this._lastPutTs;
     const timestamps = {};
     for (const f of Object.keys(fields)) timestamps[f] = now;
     return this.mergeNode(soul, fields, timestamps); // local write: mergeNode clocks it

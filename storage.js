@@ -32,7 +32,14 @@ class NodeLogStore {
 
   async appendEntries(entries) {
     const lines = entries.map((e) => JSON.stringify(e)).join('\n') + '\n';
-    await this.fs.promises.appendFile(this.filePath, lines, 'utf8');
+    // Serialize concurrent appends: two in-flight appendFile calls have no
+    // ordering guarantee relative to each other, so a fast local write racing
+    // an applied remote write could land out of logical order in the log,
+    // diverging replay order from live merge order on next boot.
+    this._writeQueue = (this._writeQueue || Promise.resolve()).then(
+      () => this.fs.promises.appendFile(this.filePath, lines, 'utf8')
+    );
+    await this._writeQueue;
   }
 
   async readAll() {
@@ -75,14 +82,16 @@ class BrowserLogStore {
   }
 
   async appendEntries(entries) {
-    const db = await this._ready;
-    return new Promise((resolve, reject) => {
+    const run = () => this._ready.then((db) => new Promise((resolve, reject) => {
       const tx = db.transaction('log', 'readwrite');
       const store = tx.objectStore('log');
       for (const e of entries) store.add(e);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
-    });
+    }));
+    // Same ordering guarantee as NodeLogStore: serialize concurrent appends.
+    this._writeQueue = (this._writeQueue || Promise.resolve()).then(run);
+    return this._writeQueue;
   }
 
   async readAll() {
@@ -141,8 +150,18 @@ class Storage {
     const entries = await this.log.readAll();
     const g = new GraphClass(graphOpts);
     for (const entry of entries) {
-      g.mergeNode(entry.soul, entry.fields, entry.ts, entry.lamportClock);
-      if (this.index) this.index.add(entry.soul);
+      try {
+        g.mergeNode(entry.soul, entry.fields, entry.ts, entry.lamportClock);
+        if (this.index) {
+          const node = g.nodes.get(entry.soul);
+          const maxTs = node ? Math.max(0, ...Object.values(node.state)) : Date.now();
+          this.index.add(entry.soul, { data: node?.data ?? null, state: node?.state ?? null, timestamp: maxTs });
+        }
+      } catch {
+        // a single structurally-invalid log entry (e.g. missing fields) must
+        // not abort the whole boot replay — skip it and keep going, same
+        // tolerance readAll() already gives a torn/unparseable line.
+      }
     }
     return g;
   }
@@ -150,7 +169,10 @@ class Storage {
   /** Persist a batch of graph writes (called after every accepted merge). Carries the field-level lamportClock map so a future boot replays real causal order, not a re-inflated local count. */
   async persist(soul, fields, ts, lamportClock) {
     await this.log.appendEntries([{ soul, fields, ts, lamportClock }]);
-    if (this.index) this.index.add(soul);
+    if (this.index) {
+      const maxTs = ts ? Math.max(0, ...Object.values(ts)) : Date.now();
+      this.index.add(soul, { data: fields, state: ts, timestamp: maxTs });
+    }
   }
 
   /** Append one reputation-ledger entry ({peerId, delta, reason, timestamp}) to durable storage, so throttle/Byzantine state survives a restart instead of resetting every peer to neutral. */
@@ -181,7 +203,7 @@ class Storage {
     const purgedSouls = [];
     for (const [soul, node] of graph.nodes) {
       const isFullyTombstoned = opts.purgeDeleted && Object.keys(node.data).length > 0
-        && Object.values(node.data).every((v) => v === null);
+        && Object.values(node.data).every((v) => v === null || v === undefined);
       if (isFullyTombstoned) {
         purgedSouls.push(soul);
         continue;

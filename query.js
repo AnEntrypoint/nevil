@@ -42,6 +42,23 @@ function selectScalars(node, fields) {
   return out;
 }
 
+/**
+ * Sort comparator that pushes missing/undefined sort keys to the end
+ * regardless of direction, instead of treating undefined===undefined as
+ * equal-to-everything (which silently misordered results with mixed field
+ * presence, since a present value could compare either way against an
+ * absent one depending on array position).
+ */
+function compareSortKeys(av, bv, sortOrder) {
+  const aMissing = av === undefined;
+  const bMissing = bv === undefined;
+  if (aMissing && bMissing) return 0;
+  if (aMissing) return 1; // missing always sorts last
+  if (bMissing) return -1;
+  const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+  return sortOrder === 'desc' ? -cmp : cmp;
+}
+
 function applyFilter(node, filter) {
   if (!filter) return true;
   for (const [key, condition] of Object.entries(filter)) {
@@ -66,10 +83,19 @@ function applyFilter(node, filter) {
  * sub-tree marker instead of throwing — one deep/cyclic branch shouldn't
  * fail the whole query when the rest of the result is perfectly valid.
  */
-function resolveOne(graph, soul, q, depth) {
-  const maxDepth = q.maxDepth || 32;
-  if (depth > maxDepth) return { soul, _depthExceeded: true };
+function resolveOne(graph, soul, q, depth, maxDepth) {
+  // maxDepth is threaded explicitly from the ROOT query call, not re-read
+  // per sub-query object: a nested selection with no maxDepth of its own
+  // must inherit the caller's configured bound, not silently reset to the
+  // 32 default (which would defeat a caller's intent to cap total depth).
+  if (maxDepth === undefined) maxDepth = q.maxDepth != null ? q.maxDepth : 32;
   const node = graph.get(soul);
+  if (depth > maxDepth) {
+    // Include the node's own requested scalar fields at the cutoff so a
+    // caller can't misread "field omitted" as "field is empty" — only
+    // further nested traversal is actually truncated here.
+    return { soul, _depthExceeded: true, ...selectScalars(node, q.select) };
+  }
   if (!node) return null;
 
   if (!applyFilter(node, q.filter)) return null;
@@ -86,18 +112,20 @@ function resolveOne(graph, soul, q, depth) {
 
     if (sub.list) {
       const refs = Array.isArray(raw) ? raw : [];
+      const seenSouls = new Set();
       let resolved = refs
-        .map((r) => (isRef(r) ? resolveOne(graph, r['#'], sub, depth + 1) : null))
+        .filter((r) => {
+          if (!isRef(r)) return false;
+          if (seenSouls.has(r['#'])) return false; // a node listing the same soul twice must not duplicate rows
+          seenSouls.add(r['#']);
+          return true;
+        })
+        .map((r) => resolveOne(graph, r['#'], sub, depth + 1, maxDepth))
         .filter((v) => v !== null);
 
       if (sub.sort) {
         const [sortKey, sortOrder] = Array.isArray(sub.sort) ? sub.sort : [sub.sort, 'asc'];
-        resolved.sort((a, b) => {
-          const av = a[sortKey];
-          const bv = b[sortKey];
-          const cmp = av < bv ? -1 : av > bv ? 1 : 0;
-          return sortOrder === 'desc' ? -cmp : cmp;
-        });
+        resolved.sort((a, b) => compareSortKeys(a[sortKey], b[sortKey], sortOrder));
       }
 
       if (sub.offset != null) resolved = resolved.slice(sub.offset);
@@ -105,7 +133,7 @@ function resolveOne(graph, soul, q, depth) {
 
       out[key] = resolved;
     } else if (isRef(raw)) {
-      out[key] = resolveOne(graph, raw['#'], sub, depth + 1);
+      out[key] = resolveOne(graph, raw['#'], sub, depth + 1, maxDepth);
     } else {
       out[key] = null;
     }
@@ -132,12 +160,7 @@ function query(graph, q) {
 
     if (q.sort) {
       const [sortKey, sortOrder] = Array.isArray(q.sort) ? q.sort : [q.sort, 'asc'];
-      results.sort((a, b) => {
-        const av = a[sortKey];
-        const bv = b[sortKey];
-        const cmp = av < bv ? -1 : av > bv ? 1 : 0;
-        return sortOrder === 'desc' ? -cmp : cmp;
-      });
+      results.sort((a, b) => compareSortKeys(a[sortKey], b[sortKey], sortOrder));
     }
 
     if (q.offset != null) results = results.slice(q.offset);

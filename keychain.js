@@ -245,7 +245,16 @@ class Keychain {
   }
 
   static fromPublicKey(publicKeyHexOrBytes) {
-    const publicKey = typeof publicKeyHexOrBytes === 'string' ? Buffer.from(publicKeyHexOrBytes, 'hex') : toBuf(publicKeyHexOrBytes);
+    let publicKey;
+    if (typeof publicKeyHexOrBytes === 'string') {
+      if (!/^[0-9a-fA-F]{64}$/.test(publicKeyHexOrBytes)) {
+        throw new RangeError('public key hex string must be exactly 64 hex chars (32 bytes)');
+      }
+      publicKey = Buffer.from(publicKeyHexOrBytes, 'hex');
+    } else {
+      publicKey = toBuf(publicKeyHexOrBytes);
+      if (publicKey.length !== 32) throw new RangeError('public key must be exactly 32 bytes');
+    }
     return new Keychain(new KeyPair({ publicKey, scalar: null }));
   }
 
@@ -299,13 +308,6 @@ class Keychain {
    */
   static composeChild(parentKeyPair, label) {
     return parentKeyPair.derive(label);
-  }
-
-  /** Derive a routing key for DHT prefix-based routing from a soul prefix. */
-  getRoutingKey(soulPrefix) {
-    // routingKey = keychain.sub('routing').sub(soulPrefix).get()
-    // Deterministic derivation via keypear; forward-only (can't recover parent from child)
-    return this.sub('routing').sub(soulPrefix).head.publicKey.toString('hex').substring(0, 4);
   }
 }
 

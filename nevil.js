@@ -41,18 +41,24 @@ const sea = require('./crypto');
 const { query } = require('./query');
 
 // Topology presets: AP (availability+partition, no coordinator, eventual
-// consistency), CA (consistency+availability, no partition tolerance —
-// requires all peers reachable, LWW resolves conflicts synchronously in
-// flood-fill), CP (consistency+partition tolerance — DHT routing +
-// Lamport clocks give causal ordering under partition, at the cost of
-// full availability during a split). Per CAP theorem no topology gets all
-// three; `topology` just picks which two this instance optimizes for and
-// configures the graph/network accordingly. Any opt explicitly passed
+// consistency — local writes always accepted even if isolated), CA
+// (consistency+availability, no partition tolerance — a real quorum gate
+// REJECTS local writes when fewer than `quorumFraction` of expected peers
+// are connected, since CA explicitly does not promise to keep working
+// during a partition; this is what actually distinguishes CA from AP,
+// not just a different label on identical flood-fill LWW config), CP
+// (consistency+partition tolerance — DHT routing + Lamport clocks give
+// causal ordering under partition, at the cost of full availability
+// during a split, but unlike CA it does NOT reject writes: partitioned
+// peers keep accepting locally and reconcile via causal ordering on
+// heal). Per CAP theorem no topology gets all three; `topology` just
+// picks which two this instance optimizes for and configures the
+// graph/network/quorum-gate accordingly. Any opt explicitly passed
 // overrides the preset (explicit config always wins over topology default).
 const TOPOLOGY_PRESETS = {
-  ap: { conflictResolution: 'lww', dhtEnabled: false },
-  ca: { conflictResolution: 'lww', dhtEnabled: false },
-  cp: { conflictResolution: 'lww', dhtEnabled: true },
+  ap: { conflictResolution: 'lww', dhtEnabled: false, quorumFraction: 0 },
+  ca: { conflictResolution: 'lww', dhtEnabled: false, quorumFraction: 0.5 },
+  cp: { conflictResolution: 'lww', dhtEnabled: true, quorumFraction: 0 },
 };
 
 function resolveTopologyOpts(opts) {
@@ -68,6 +74,13 @@ class Nevil {
     opts = resolveTopologyOpts(opts);
     this.opts = opts;
     this.topology = opts.topology ? String(opts.topology).toLowerCase() : null;
+    // Quorum: fraction of configured peers (opts.peers.length) that must be
+    // CONNECTED for a local write to be accepted. 0 (AP/CP default) means
+    // no gate — always accept, matching each mode's real CAP tradeoff (see
+    // TOPOLOGY_PRESETS comment). Only meaningful with a nonzero configured
+    // peer list; with no peers configured there is nothing to be a quorum
+    // of, so the gate never fires (single-node/dev usage is unaffected).
+    this.QUORUM_FRACTION = opts.quorumFraction || 0;
     this.storage = new Storage({ ...opts, enableIndex: opts.enableSoulIndex });
     this.graph = new Graph(opts);
     this._ready = this._boot();
@@ -109,8 +122,12 @@ class Nevil {
         ts[f] = this.graph.getState(soul)[f];
         lamport[f] = graphNode?.lamport[f];
       }
-      if (this.storage.index) this.storage.index.add(soul);
-      this.storage.persist(soul, fields, ts, lamport);
+      // persist() also updates the soul index with real entry data. Not
+      // awaited (this handler is sync, called from graph.onAny), but its
+      // rejection is caught explicitly — an uncaught rejection here (e.g.
+      // disk full, permission error) would otherwise crash the process on
+      // an otherwise-recoverable I/O error.
+      this.storage.persist(soul, fields, ts, lamport).catch((err) => this._onPersistError(err, soul));
       // Gossip reputation ledger along with graph writes
       let msg = { type: 'put', soul, fields, ts, reputationLedger: this.network.reputationLedger, lamportClock: this._lamportClock };
       if (this.network.POW_ENABLED) {
@@ -150,14 +167,44 @@ class Nevil {
       // carrying each changed field's lamport clock so a future boot replays true causal order
       const lamport = {};
       for (const f of changed) lamport[f] = msg.lamportClock;
-      this.storage.persist(msg.soul, msg.fields, msg.ts, lamport);
+      this.storage.persist(msg.soul, msg.fields, msg.ts, lamport).catch((err) => this._onPersistError(err, msg.soul));
     }
+  }
+
+  /**
+   * Default persist-failure handler: log and keep running rather than let
+   * an unhandled promise rejection crash the process. The write already
+   * landed in-memory (graph state is correct); only the durable log write
+   * failed, so this is a durability-degradation event, not data loss of
+   * the current in-memory state. Callers wanting custom handling (retry,
+   * alerting, etc.) can override `nevil.onPersistError`.
+   */
+  _onPersistError(err, soul) {
+    if (this.onPersistError) return this.onPersistError(err, soul);
+    console.error(`nevil: storage.persist failed for soul ${soul} (write remains in-memory, not yet durable):`, err);
   }
 
   // --- graph API ---------------------------------------------------------
 
-  /** Write fields onto a node addressed by soul (a hex public key, or any string). */
+  /**
+   * Check whether enough configured peers are currently connected to
+   * satisfy this instance's quorum requirement. Always true when no
+   * quorum fraction is configured (AP/CP) or no peers were configured at
+   * construction (nothing to be a quorum of).
+   */
+  _hasQuorum() {
+    if (!this.QUORUM_FRACTION) return true;
+    const configuredPeers = (this.opts.peers || []).length;
+    if (configuredPeers === 0) return true;
+    const connected = this.network ? this.network.sockets.size : 0;
+    return connected / configuredPeers >= this.QUORUM_FRACTION;
+  }
+
+  /** Write fields onto a node addressed by soul (a hex public key, or any string). Throws if this instance's quorum requirement (CA topology) is not currently met — CA explicitly does not promise availability during a partition. */
   put(soul, fields) {
+    if (!this._hasQuorum()) {
+      throw new Error(`quorum not met: CA topology requires >= ${Math.ceil(this.QUORUM_FRACTION * (this.opts.peers || []).length)} of ${(this.opts.peers || []).length} configured peers connected, write rejected`);
+    }
     this.graph.put(soul, fields);
     return this;
   }
@@ -280,14 +327,18 @@ class Nevil {
   /**
    * Delete a soul by clearing all its fields.
    * Compatible with SQLite DELETE and GraphQL deleteX patterns.
+   * Returns true if the soul had fields and was cleared, false if it was
+   * already absent/empty — callers can distinguish "deleted something"
+   * from "there was nothing to delete" instead of always getting null.
    */
   delete(soul) {
     const node = this.get(soul);
-    if (!node) return undefined;
+    const hasLiveField = node && Object.values(node).some((v) => v !== null && v !== undefined);
+    if (!hasLiveField) return false; // nothing to clear: soul absent, or already fully tombstoned
     const cleared = {};
     for (const k of Object.keys(node)) cleared[k] = null;
     this.put(soul, cleared);
-    return null;
+    return true;
   }
 
   /**
@@ -384,7 +435,15 @@ class Nevil {
 
     const signed = {};
     for (const [k, v] of Object.entries(fields)) {
-      const sig = keyPair.sign(Buffer.from(JSON.stringify(v)));
+      if (v === undefined) {
+        throw new Error(`putAt: field "${k}" is undefined — JSON.stringify(undefined) produces no signable value; use null to explicitly clear a field instead`);
+      }
+      // Sign {field name, value} together, not just the value — otherwise a
+      // validly-signed {v, sig} pair from one field could be copy-pasted
+      // onto a different field name on the same node (e.g. "title" ->
+      // "isAdmin") and getAtVerified would still accept the signature,
+      // since it never covered which field it was for.
+      const sig = keyPair.sign(Buffer.from(JSON.stringify({ k, v })));
       signed[k] = { v, sig: sig.toString('hex') };
     }
     const ownerSig = keyPair.sign(Buffer.from(JSON.stringify(this._identity.soul)));
@@ -470,8 +529,13 @@ class Nevil {
 
     const out = {};
     for (const [k, v] of Object.entries(node)) {
+      if (k === '_owner' || k === '_path') continue; // custody markers, already verified above with their own (unwrapped) signing scheme
       if (v && typeof v === 'object' && v.sig) {
-        const ok = subKeyPair.verify(Buffer.from(JSON.stringify(v.v)), Buffer.from(v.sig, 'hex'));
+        // Verify against {k, v} together, matching putAt's signing scheme —
+        // a signature only ever covers the specific field name it was made
+        // for, so it cannot be replayed onto a different field on the same
+        // (or any other) node.
+        const ok = subKeyPair.verify(Buffer.from(JSON.stringify({ k, v: v.v })), Buffer.from(v.sig, 'hex'));
         out[k] = ok ? v.v : undefined;
       }
     }
@@ -502,9 +566,14 @@ class Nevil {
   async batchWrite(fields, options = {}) {
     if (!this._identity) throw new Error('batchWrite requires an identity (call createIdentity or unlock first)');
     this._lamportClock++; // advance clock before deriving the nonce so it's part of the deterministic input
+    // Sort keys before stringifying: JSON.stringify is key-order-sensitive,
+    // so two semantically-identical fields objects with keys inserted in a
+    // different order would otherwise hash to different nonces, defeating
+    // the "identical calls land at the same sub-address" determinism goal.
+    const canonicalFields = JSON.stringify(fields, Object.keys(fields).sort());
     const nonce = options.nonce !== undefined
       ? options.nonce
-      : Buffer.from(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(fields) + ':' + this._lamportClock))).toString('hex').slice(0, 16);
+      : Buffer.from(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalFields + ':' + this._lamportClock))).toString('hex').slice(0, 16);
     const txnKeychain = this._identity.keychain.sub('txn').sub(nonce);
     const txnId = txnKeychain.head.publicKey.toString('hex');
     const batchPath = ['txn', txnId];
