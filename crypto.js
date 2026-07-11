@@ -15,6 +15,11 @@
 
 const subtle = globalThis.crypto.subtle;
 
+// Shared so a payload always records the iteration count it was actually
+// sealed with, letting this constant rise later without breaking decryption
+// of previously-sealed payloads (see PBKDF2_ITERATIONS fallback below).
+const PBKDF2_ITERATIONS = 100000;
+
 // btoa/atob exist in browsers; polyfill minimally for Node. Declared before
 // toB64/fromB64 (which close over them) so there is no temporal-dead-zone
 // hazard if either is ever called during module load, not just after.
@@ -54,18 +59,22 @@ async function encryptWithPass(data, passphrase, saltB64) {
     }
   }
   const salt = saltB64 !== undefined ? fromB64(saltB64) : globalThis.crypto.getRandomValues(new Uint8Array(16));
-  const baseKey = await subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+  const baseKey = await subtle.importKey('raw', new TextEncoder().encode(passphrase.normalize('NFC')), 'PBKDF2', false, ['deriveKey']);
   const key = await subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
     baseKey,
     { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt', 'decrypt']
   );
   const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
-  const pt = new TextEncoder().encode(JSON.stringify(data));
+  const json = JSON.stringify(data);
+  if (json === undefined) {
+    throw new Error('data must not be undefined');
+  }
+  const pt = new TextEncoder().encode(json);
   const ct = await subtle.encrypt({ name: 'AES-GCM', iv }, key, pt);
-  return { ct: toB64(ct), iv: toB64(iv), salt: toB64(salt) };
+  return { ct: toB64(ct), iv: toB64(iv), salt: toB64(salt), iterations: PBKDF2_ITERATIONS };
 }
 
 async function decryptWithPass(payload, passphrase) {
@@ -76,9 +85,12 @@ async function decryptWithPass(payload, passphrase) {
     throw new Error('corrupt or malformed sealed payload: expected {salt, iv, ct} base64url strings');
   }
   const salt = fromB64(payload.salt);
-  const baseKey = await subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+  // Legacy payloads (sealed before this field existed) always used 100000 —
+  // PBKDF2_ITERATIONS' current value — so the fallback keeps them decryptable.
+  const iterations = typeof payload.iterations === 'number' ? payload.iterations : PBKDF2_ITERATIONS;
+  const baseKey = await subtle.importKey('raw', new TextEncoder().encode(passphrase.normalize('NFC')), 'PBKDF2', false, ['deriveKey']);
   const key = await subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
     baseKey,
     { name: 'AES-GCM', length: 256 },
     false,

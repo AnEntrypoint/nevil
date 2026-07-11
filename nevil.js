@@ -35,7 +35,7 @@
 
 const { Graph, isRef, ref } = require('./graph');
 const { Storage } = require('./storage');
-const { Network, randomId } = require('./network');
+const { Network, randomId, canonicalJSON } = require('./network');
 const { Keychain, KeyPair, encryptFor: keychainEncryptFor } = require('./keychain');
 const sea = require('./crypto');
 const { query } = require('./query');
@@ -121,9 +121,32 @@ class Nevil {
     // behind what the graph itself already recorded.
     this._lamportClock = this.graph.localClock;
 
-    this.network = new Network(this._bootOpts, (msg) => {
+    // Durable reputation ledger: load and hand to Network BEFORE it opens any
+    // socket (dial/listen happen synchronously inside the Network constructor
+    // below), so there is no boot window where live traffic is evaluated
+    // against an empty ledger with no persist hook wired — a penalty assessed
+    // in that window would otherwise be silently lost across restart.
+    const priorLedger = await this.storage.loadReputationLedger();
+    if (this._closed) return this;
+    this.network = new Network({
+      ...this._bootOpts,
+      priorReputationLedger: priorLedger,
+      // Must not be fire-and-forget uncaught: persistReputationEntry is async
+      // and rejects on real I/O failure (disk full, permission error). With
+      // no .catch, network.js's updateReputation() call site (fire-and-forget
+      // by design — it must not need to know this hook returns a Promise)
+      // turns that rejection into an unhandled promise rejection that crashes
+      // the whole process. Matches the graceful-degradation pattern already
+      // used for storage.persist(...) at the graph.onAny/_applyRemote sites below.
+      onReputationDelta: (entry) => this.storage.persistReputationEntry(entry).catch((err) => this._onPersistError(err, entry.peerId)),
+    }, (msg) => {
       if (msg.type === 'put') this._applyRemote(msg);
     });
+    // Seed the gossip watermark from the restored ledger's total-ever-pushed
+    // count (not raw .length — once the FIFO starts shifting, .length stays
+    // capped at maxReputationLedger while the true position keeps advancing,
+    // so a length-only cursor silently misaligns and drops entries from gossip).
+    this._lastGossipedLedgerLength = (this.network.reputationLedgerShifted || 0) + this.network.reputationLedger.length;
     // Restore previously-learned routing-bucket knowledge (see network.js
     // peerRoutingKeys) — these keys are keyed by peerKey (address:port),
     // which is only meaningful once that same peer reconnects, but seeding
@@ -141,22 +164,9 @@ class Nevil {
     }, this.opts.peerTableSaveFreq || 30000);
     if (this._peerTableSaveTimer.unref) this._peerTableSaveTimer.unref();
 
-    // Durable reputation ledger: replay before any live traffic so a
-    // restarted peer doesn't treat a previously-Byzantine peer as neutral,
-    // then persist every new delta so future restarts stay accurate.
-    const priorLedger = await this.storage.loadReputationLedger();
-    if (this._closed) { this.network.close(); return this; }
-    this.network.restoreReputationLedger(priorLedger);
-    this.network.onReputationDelta = (entry) => this.storage.persistReputationEntry(entry);
-    // Seed the gossip watermark from the restored ledger's total-ever-pushed
-    // count (not raw .length — once the FIFO starts shifting, .length stays
-    // capped at maxReputationLedger while the true position keeps advancing,
-    // so a length-only cursor silently misaligns and drops entries from gossip).
-    this._lastGossipedLedgerLength = (this.network.reputationLedgerShifted || 0) + this.network.reputationLedger.length;
-
     // Every local write that actually changes state gets persisted and gossiped.
     this._unsubAny = this.graph.onAny((soul, node, changedFields) => {
-      if (this._suppressBroadcastSoul === soul) return; // set while applying a remote write for this exact soul
+      if (this._isSuppressedNotify(soul, changedFields)) return; // this exact notify IS the direct echo of an in-flight _applyRemote merge
       this._lamportClock++; // advance global clock on every local (gossiped) write
       const fields = {};
       const ts = {};
@@ -190,7 +200,10 @@ class Nevil {
       const msgId = randomId();
       let msg = { id: msgId, type: 'put', soul, fields, ts, reputationLedger, lamportClock: this._lamportClock };
       if (this.network.POW_ENABLED) {
-        msg.pow = Network.solvePoW(soul, this.network.POW_DIFFICULTY, msgId);
+        // Bind the puzzle to fields/ts too, not just soul+id — otherwise a
+        // relaying peer could swap this write's actual content in transit
+        // while keeping the same valid PoW solution (see network.js _verifyPoW).
+        msg.pow = Network.solvePoW(soul, this.network.POW_DIFFICULTY, msgId, fields, ts);
       }
       // Byzantine resilience: attach sender (identity soul) + signature if identity is set
       if (this._identity) {
@@ -199,7 +212,12 @@ class Nevil {
         delete msgCopy.id;
         delete msgCopy.sender;
         delete msgCopy.signature;
-        const msgBody = JSON.stringify(msgCopy, Object.keys(msgCopy).sort());
+        // canonicalJSON, not JSON.stringify(msgCopy, Object.keys(msgCopy).sort())
+        // — the array-form replacer is a recursive key ALLOWLIST at every
+        // nesting level, so nested `fields` content always serialized as
+        // `{}` and was never actually covered by the signature. Must stay
+        // byte-for-byte consistent with the verify side in network.js.
+        const msgBody = canonicalJSON(msgCopy);
         const keyPair = this._identity.keychain.get();
         if (keyPair.writable) {
           const sig = keyPair.sign(Buffer.from(msgBody));
@@ -239,16 +257,33 @@ class Nevil {
   }
 
   _applyRemote(msg) {
-    // Scoped to msg.soul (not a blanket boolean): mergeNode's fan-out
-    // (graph._notify) runs synchronously, so a listener reacting to this
-    // remote write can itself call put() on a DIFFERENT soul before this
-    // call returns. A blanket flag would suppress that nested write's
-    // broadcast too, even though it's a genuinely new local write the peer
-    // network has never seen — only the echo of msg.soul itself should be
-    // suppressed. Save/restore the previous value (rather than clearing to
-    // undefined) so nested remote-applies for the same soul still nest correctly.
-    const prevSuppressSoul = this._suppressBroadcastSoul;
-    this._suppressBroadcastSoul = msg.soul;
+    // Mirrors the local-path guard in put() — a non-string/empty msg.soul
+    // arriving over the network must never reach mergeNode/storage.persist,
+    // or a garbage-keyed node durably pollutes graph.nodes and round-trips
+    // through disk on every future boot. network.js's keychain-soul check
+    // (_isKeychainDerived) string-coerces and simply mismatches a non-string
+    // soul rather than rejecting it, so this guard is the only place on the
+    // remote-apply path that actually validates shape.
+    if (typeof msg.soul !== 'string' || !msg.soul) return;
+    // Push a stack frame (soul + the field set this merge is about to write)
+    // rather than setting a single scalar: mergeNode's fan-out (graph._notify)
+    // runs synchronously, and its per-soul listeners run BEFORE its wildcard
+    // (onAny) listener — so a graph.on(soul, fn) listener reacting to this
+    // remote write by synchronously calling put() on the SAME soul triggers
+    // its own nested mergeNode -> _notify -> onAny call, which fires and
+    // unwinds entirely BEFORE the outer mergeNode's own _notify reaches its
+    // wildcard loop. A single scalar equal-by-soul check can't tell that
+    // nested, genuinely-new-fields notify apart from the outer merge's own
+    // direct echo (both compare equal on soul alone) and would wrongly
+    // suppress the nested write's broadcast too. Matching on the frame's
+    // declared field set (via _isSuppressedNotify, consumed at most once) as
+    // well as soul means a nested write carrying different field names (the
+    // realistic shape of this pattern — a normalization/derived-field
+    // listener writes NEW fields, not the ones the remote message carried)
+    // is correctly let through and broadcast.
+    const frame = { soul: msg.soul, fields: new Set(Object.keys(msg.fields || {})), consumed: false };
+    this._suppressStack = this._suppressStack || [];
+    this._suppressStack.push(frame);
     let changed;
     try {
       changed = this.graph.mergeNode(msg.soul, msg.fields, msg.ts, msg.lamportClock);
@@ -257,7 +292,7 @@ class Nevil {
       // arbitrary huge clock must not poison every future gossip from this node.
       if (this.graph.localClock > this._lamportClock) this._lamportClock = this.graph.localClock;
     } finally {
-      this._suppressBroadcastSoul = prevSuppressSoul;
+      this._suppressStack.pop();
     }
     if (changed.length) {
       // persist accepted remote writes too, so every peer's disk log is a full replica,
@@ -293,6 +328,32 @@ class Nevil {
     console.error(`nevil: storage.persist failed for soul ${soul} (write remains in-memory, not yet durable):`, err);
   }
 
+  /**
+   * Decide whether the wildcard-listener notify currently firing (soul +
+   * changedFields) IS the direct echo of an in-flight _applyRemote merge for
+   * that same soul, as opposed to a nested write a listener made during that
+   * merge's own fan-out (see _applyRemote's frame-push comment for the full
+   * ordering argument). Checked against every currently-open frame (not just
+   * the top of stack) since a nested DIFFERENT-soul _applyRemote could sit
+   * between two same-soul frames on the stack. A frame is consumed (matched)
+   * at most once — after that, any further same-soul/same-fields notify
+   * (e.g. a second, unrelated local write that happens to touch the same
+   * field names) is a genuinely new event and must broadcast normally.
+   */
+  _isSuppressedNotify(soul, changedFields) {
+    const stack = this._suppressStack;
+    if (!stack || !stack.length) return false;
+    for (let i = stack.length - 1; i >= 0; i--) {
+      const frame = stack[i];
+      if (frame.consumed || frame.soul !== soul) continue;
+      if (changedFields.every((f) => frame.fields.has(f))) {
+        frame.consumed = true;
+        return true;
+      }
+    }
+    return false;
+  }
+
   // --- graph API ---------------------------------------------------------
 
   /**
@@ -305,7 +366,7 @@ class Nevil {
     if (!this.QUORUM_FRACTION) return true;
     const configuredPeers = this._quorumPeerCount();
     if (configuredPeers === 0) return true;
-    const connected = this.network ? this.network.sockets.size : 0;
+    const connected = this._quorumConnectedCount();
     return connected / configuredPeers >= this.QUORUM_FRACTION;
   }
 
@@ -317,6 +378,36 @@ class Nevil {
   // peers are actually dialed.
   _quorumPeerCount() {
     return ((this._bootOpts || this.opts).peers || []).length;
+  }
+
+  /**
+   * Numerator for the quorum gate: connected sockets that correspond to a
+   * configured/resumed peer URL, NOT raw `network.sockets.size`. That raw
+   * count includes every unauthenticated inbound connection accepted via
+   * `opts.server`'s WebSocketServer (network.js's `_startServer`) with no
+   * identity check at all — an attacker who can reach the relay endpoint
+   * could otherwise force a CA node's quorum gate to pass during a genuine
+   * partition from its real configured peers, just by opening throwaway
+   * connections. `network._dial()` stamps `ws._dialUrl` on every socket IT
+   * initiated (network.js:167); inbound/server-attached sockets never get
+   * that property, so filtering on it (matched against the same configured
+   * peer set `_quorumPeerCount()` uses as the denominator) restricts the
+   * numerator to sockets that are actually one of the peers being quorate over.
+   */
+  _quorumConnectedCount() {
+    if (!this.network) return 0;
+    const configuredPeers = new Set((this._bootOpts || this.opts).peers || []);
+    let count = 0;
+    for (const ws of this.network.sockets) {
+      // readyState 1 === OPEN in both Node's `ws` and the browser's native
+      // WebSocket. network.js adds a socket to `sockets` at dial time
+      // (before the connection handshake completes) and only removes it on
+      // close, so without this check a still-CONNECTING socket to a peer
+      // that will never actually come up counts toward quorum for the
+      // duration of the connection attempt.
+      if (ws._dialUrl && ws.readyState === 1 && configuredPeers.has(ws._dialUrl)) count++;
+    }
+    return count;
   }
 
   /** Write fields onto a node addressed by soul (a hex public key, or any string). Throws if this instance's quorum requirement (CA topology) is not currently met — CA explicitly does not promise availability during a partition. */
@@ -386,6 +477,11 @@ class Nevil {
     await this.storage.compact(this.graph, opts);
   }
 
+  /** Rewrite the reputation log to one summed entry per peerId — see Storage.compactReputationLog. Call periodically the same way compact() is called for the main graph log. */
+  async compactReputationLog() {
+    await this.storage.compactReputationLog();
+  }
+
   // --- Soul indexing for range queries (optional) -------------------------
 
   /**
@@ -452,6 +548,10 @@ class Nevil {
    * from "there was nothing to delete" instead of always getting null.
    */
   delete(soul) {
+    // Same guard put() applies: without it, a non-string/empty soul just
+    // misses this.get() and silently returns false instead of surfacing the
+    // same TypeError put()/insert()/update() throw for the identical input.
+    if (typeof soul !== 'string' || !soul) throw new TypeError('delete: soul must be a non-empty string');
     const node = this.get(soul);
     const hasLiveField = node && Object.values(node).some((v) => v !== null && v !== undefined);
     if (!hasLiveField) return false; // nothing to clear: soul absent, or already fully tombstoned
@@ -566,6 +666,12 @@ class Nevil {
    */
   async putAt(path, fields) {
     if (!this._identity) throw new Error('no active identity — call createIdentityFromSeed or unlock first');
+    // Mirrors graph.put()'s own guard: without it, a string/array `fields`
+    // silently explodes into one signed field per character/index via
+    // Object.entries below, instead of being rejected up front.
+    if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {
+      throw new TypeError('putAt: fields must be a plain object');
+    }
     let chain = this._identity.keychain;
     for (const label of path) chain = chain.sub(label);
     const keyPair = chain.get();
@@ -730,8 +836,14 @@ class Nevil {
     const txnId = txnKeychain.head.publicKey.toString('hex');
     const batchPath = ['txn', txnId];
     this._lamportClock++; // advance clock for the persisted write metadata only, after the digest is derived
-    fields._lamportClock = this._lamportClock;
-    return this.putAt(batchPath, fields);
+    // Stamp onto a shallow copy, never the caller's own object: mutating
+    // `fields` in place here means a second batchWrite(fields) call reusing
+    // the same reference would compute canonicalFields (above) over the
+    // leftover _lamportClock key from the prior call, breaking this method's
+    // own idempotent-replay guarantee (identical calls landing at the same
+    // sub-address).
+    const stamped = { ...fields, _lamportClock: this._lamportClock };
+    return this.putAt(batchPath, stamped);
   }
 
   /**
@@ -746,11 +858,27 @@ class Nevil {
     return this.network;
   }
 
-  /** Add reputation delta to peer's karma ledger (delegates to network's ledger). */
+  /**
+   * Add reputation delta to peer's karma ledger (delegates to network's
+   * ledger), then mirror the entry onto the graph for visibility. The quorum
+   * check (the same gate `put()` itself applies) runs FIRST, before the
+   * network ledger is touched: `network.updateReputation` commits
+   * synchronously and unconditionally (ledger push + cache update + durable
+   * persist hook), so applying it before a `put()` that can throw on CA
+   * quorum loss would leave the caller with an exception while the delta had
+   * already landed with no way to roll it back. Checking quorum up front
+   * means a rejected call never mutates network state at all.
+   */
   addReputation(peerId, delta, reason = '') {
+    if (!this._hasQuorum()) {
+      const configuredPeers = this._quorumPeerCount();
+      throw new Error(`quorum not met: CA topology requires >= ${Math.ceil(this.QUORUM_FRACTION * configuredPeers)} of ${configuredPeers} configured peers connected, write rejected`);
+    }
     this._lamportClock++;
     const entry = this._requireNetwork('addReputation').updateReputation(peerId, delta, reason || 'good');
-    // Persist to graph under ['reputation', peerId] for visibility
+    // Persist to graph under ['reputation', peerId] for visibility. Quorum
+    // was already confirmed above, so put()'s own quorum check cannot fire
+    // here; it still runs put()'s other guards (soul validation, etc.).
     const repPath = ['reputation', peerId];
     this.put(repPath.join(':'), entry);
     return entry;

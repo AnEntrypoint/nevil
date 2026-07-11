@@ -5,8 +5,15 @@
   "main": "nevil.js",
   "scripts": {},
   "dependencies": {
-    "sodium-universal": "^5.0.1",
+    "sodium-universal": "^5.0.1"
+  },
+  "peerDependencies": {
     "ws": "^8.18.0"
+  },
+  "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    }
   },
   "engines": {
     "node": ">=19"

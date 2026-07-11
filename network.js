@@ -30,6 +30,25 @@ function commonPrefixLength(a, b) {
   return i;
 }
 
+/**
+ * Deep-canonicalize a value for signing/verifying: recursively sorts object
+ * keys at EVERY nesting level, not just the top. `JSON.stringify(value,
+ * Object.keys(value).sort())` looks like a top-level key sort but is
+ * actually a recursive key ALLOWLIST — nested objects whose own keys aren't
+ * in that top-level array (e.g. a `fields.title` value) silently serialize
+ * as `{}` regardless of their real contents, so a signature "covering" the
+ * message body never actually covered nested field data. This produces a
+ * real deterministic, order-independent JSON string instead.
+ */
+function canonicalJSON(value) {
+  if (Array.isArray(value)) return '[' + value.map(canonicalJSON).join(',') + ']';
+  if (value !== null && typeof value === 'object') {
+    const keys = Object.keys(value).sort();
+    return '{' + keys.map((k) => JSON.stringify(k) + ':' + canonicalJSON(value[k])).join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+
 class Network {
   /**
    * @param {object} opts
@@ -65,6 +84,22 @@ class Network {
     this.reputationCacheOrder = []; // bounded FIFO, mirrors seen/seenOrder — a gossiping peer must not grow this map unbounded via fabricated peerIds
     this.messageQueue = []; // messages queued from throttled peers
 
+    // Reputation-gossip trust bounds. A reputationLedger-bearing message
+    // requires no authentication of its own (the message it rides on may be
+    // a fully unsigned put to a plain, non-keychain soul), so gossip entries
+    // are treated as unauthenticated hearsay, not a corroborated observation:
+    // the per-entry clamp is sized to the largest single LOCAL-observation
+    // delta (REP_DELTA_REPLAY, -5), not the old flat +/-100, so one gossip
+    // entry alone can no longer drive a neutral peerId straight past the
+    // default REP_DROP_THRESHOLD (-10) in a single message. Distinct peerId
+    // TARGETS are also rate-limited per reporting CONNECTION per window, so
+    // one connection can't poison an unbounded number of victim peerIds.
+    this.REP_GOSSIP_DELTA_MIN = opts.repGossipDeltaMin ?? -5;
+    this.REP_GOSSIP_DELTA_MAX = opts.repGossipDeltaMax ?? 10;
+    this.REP_GOSSIP_MAX_TARGETS = opts.repGossipMaxTargets || 20; // distinct peerIds one connection may gossip about per window
+    this.REP_GOSSIP_WINDOW_MS = opts.repGossipWindowMs || 60000;
+    this._gossipTargetsByConn = new Map(); // connKey -> { targets: Set<peerId>, windowStart: ms }
+
     // DHT tuning parameters
     this.DHT_K = opts.dhtK || 3; // K-nearest peers per bucket
     this.DHT_L = opts.dhtL || 2; // L adjacent buckets to gossip to
@@ -84,15 +119,18 @@ class Network {
     this.DHT_MULTIHOP_ENABLED = opts.dhtMultihopEnabled === true;
     this.DHT_MAX_HOPS = opts.dhtMaxHops || 6; // TTL cap so multi-hop relay can't loop/run away
 
-    // Lamport clock guards
+    // Lamport clock guards. The real per-connection replay guard (peerClocks,
+    // in handleMessage below) uses only a plain monotonicity comparison
+    // (msg.lamportClock <= prior) — CLOCK_FAST_THRESHOLD/CLOCK_CONSENSUS_SPREAD
+    // were assigned here but never read anywhere in this file (the same dead-
+    // code class the fifth audit pass already removed from graph.js); removed
+    // rather than left as a phantom Byzantine-detection claim with no code
+    // behind it.
     this.CLOCK_MAX_JUMP = opts.clockMaxJump || 1000; // max clock steps ahead allowed
-    this.CLOCK_FAST_THRESHOLD = opts.clockFastThreshold || 1000; // steps/sec for Byzantine detection
-    this.CLOCK_CONSENSUS_SPREAD = opts.clockConsensusSpread || 10000; // max acceptable peer clock spread
 
     // Reputation thresholds
     this.REP_ACCEPT_THRESHOLD = opts.repAcceptThreshold || 0; // score >= this: accept
-    this.REP_QUEUE_MIN = opts.repQueueMin || -10; // score in [-10, 0): queue
-    this.REP_DROP_THRESHOLD = opts.repDropThreshold || -10; // score < -10: drop
+    this.REP_DROP_THRESHOLD = opts.repDropThreshold || -10; // score < this: drop, else queue
     this.REP_DELTA_GOOD = opts.repDeltaGood || 1; // +1 for valid write
     this.REP_DELTA_MALFORMED = opts.repDeltaMalformed || -1; // -1 for malformed
     this.REP_DELTA_REPLAY = opts.repDeltaReplay || -5; // -5 for replay/duplicate
@@ -120,6 +158,17 @@ class Network {
     this.POW_ADAPTIVE_HIGH_RATE = opts.powAdaptiveHighRate || 50; // puts/window above which difficulty ratchets up
     this.POW_ADAPTIVE_LOW_RATE = opts.powAdaptiveLowRate || 5; // puts/window below which difficulty relaxes down
     this._powPutTimestamps = []; // sliding window of accepted-put arrival times, for rate measurement
+
+    // Reputation ledger must be authoritative BEFORE any socket is opened:
+    // _startServer/_dial below begin accepting/processing real peer traffic
+    // synchronously from this constructor. Accepting opts.priorReputationLedger
+    // and opts.onReputationDelta here (rather than the caller wiring them via
+    // restoreReputationLedger()/onReputationDelta= after construction) closes
+    // the boot-time window where a previously-Byzantine peer would be
+    // evaluated as neutral and any penalty assessed during that window was
+    // silently lost (never persisted, since the hook wasn't wired yet).
+    if (opts.onReputationDelta) this.onReputationDelta = opts.onReputationDelta;
+    if (opts.priorReputationLedger) this.restoreReputationLedger(opts.priorReputationLedger);
 
     if (isNode && this.opts.server) this._startServer();
     for (const url of this.opts.peers || []) this._dial(url);
@@ -187,6 +236,18 @@ class Network {
     const handleClose = () => {
       this.sockets.delete(ws);
       this.metrics.peersConnected = this.sockets.size;
+      // _getPeerKey is address:port (Node) — ephemeral per TCP connection, so
+      // a reconnect never reuses this key. Without cleanup here, every past
+      // connection leaves a permanent stale entry in these three peer-keyed
+      // maps, unlike every other collection in this file (seen, reputation
+      // ledger/cache, messageQueue, _directSendTargets, _ackedIds), which are
+      // all bounded-FIFO or otherwise capped. Stale entries are harmless to
+      // correctness (routing/relay only reads currently-connected sockets)
+      // but grow memory without bound under normal connection churn.
+      this.peerHealthScores.delete(peerKey);
+      this.peerRoutingKeys.delete(peerKey);
+      if (this.peerClocks) this.peerClocks.delete(peerKey);
+      this._gossipTargetsByConn.delete(peerKey);
       // Self-heal: redial only sockets we initiated (not server-attached).
       // Tracked in _redialTimers (not just left as a bare setTimeout) so
       // close() can cancel it even though the socket already left `sockets`
@@ -232,7 +293,17 @@ class Network {
         // the id straight back proves nothing about real propagation and
         // would let that single peer forge the ACK for free.
         const directTargets = this._directSendTargets?.get(msg.id);
-        if (!directTargets || !directTargets.has(this._getPeerKey(ws))) {
+        const notADirectTarget = !directTargets || !directTargets.has(this._getPeerKey(ws));
+        // Require the re-delivered frame to actually carry the ORIGINAL
+        // message body (verified against a digest recorded at broadcast
+        // time), not just a bare {id} echo — otherwise ANY connected peer
+        // that was never a direct send target (e.g. outside the DHT-selected
+        // bucket) could forge the loop-back ACK for free with a minimal
+        // {id} frame, silently suppressing the DHT_FALLBACK_THRESHOLD
+        // reflood safety net for a message that never actually propagated.
+        const expectedDigest = this._sentDigests?.get(msg.id);
+        const digestMatches = expectedDigest === undefined || expectedDigest === canonicalJSON({ soul: msg.soul, fields: msg.fields, ts: msg.ts });
+        if (notADirectTarget && digestMatches) {
           this._ackedIds = this._ackedIds || new Set();
           this._ackedIds.add(msg.id);
           if (this._ackedIds.size > this.maxSeen) this._ackedIds.delete(this._ackedIds.values().next().value);
@@ -281,6 +352,17 @@ class Network {
       // shared counter to block others. Per-socket tracking means an attacker
       // can only ever race against their own connection's prior clock.
       if (msg.lamportClock !== undefined) {
+        // A non-numeric lamportClock (e.g. the per-field-map shape
+        // graph.mergeNode also accepts as valid) coerces to NaN in the `<=`
+        // compare below, which is always false — the message would be
+        // accepted AND the object stored as the new `prior`, permanently
+        // breaking replay protection for this connection since every future
+        // numeric compare against a stored object is also NaN-based. Reject
+        // non-finite-number clocks the same as any other malformed field.
+        if (typeof msg.lamportClock !== 'number' || !Number.isFinite(msg.lamportClock)) {
+          this.updateReputation(connKey, this.REP_DELTA_MALFORMED, 'malformed');
+          return;
+        }
         const lastClock = this.peerClocks = this.peerClocks || new Map();
         const prior = lastClock.get(connKey) || 0;
         if (msg.lamportClock <= prior) {
@@ -298,7 +380,7 @@ class Network {
       }
       // PoW verification: when enabled, every write must carry a valid puzzle solution;
       // when a puzzle is present regardless of the flag, verify it (never trust unchecked work).
-      if (this.POW_ENABLED && msg.type === 'put' && !this._verifyPoW(msg.soul, msg.pow, msg.id)) {
+      if (this.POW_ENABLED && msg.type === 'put' && !this._verifyPoW(msg.soul, msg.pow, msg.id, msg.fields, msg.ts)) {
         this.metrics.powDropped = (this.metrics.powDropped || 0) + 1;
         // Penalize the CONNECTION, not msg.sender — same rationale as the
         // signature-failure site above: sender is only authenticated if a
@@ -309,7 +391,7 @@ class Network {
         this.updateReputation(connKey, this.REP_DELTA_BYZANTINE, 'byzantine');
         return; // missing or invalid PoW, drop and penalize sender
       }
-      if (!this.POW_ENABLED && msg.pow && !this._verifyPoW(msg.soul, msg.pow, msg.id)) {
+      if (!this.POW_ENABLED && msg.pow && !this._verifyPoW(msg.soul, msg.pow, msg.id, msg.fields, msg.ts)) {
         this.metrics.powDropped = (this.metrics.powDropped || 0) + 1;
         // Penalize the CONNECTION, not msg.sender — see rationale above.
         this.updateReputation(connKey, this.REP_DELTA_BYZANTINE, 'byzantine');
@@ -334,6 +416,24 @@ class Network {
       }
       if (msg.reputationLedger && Array.isArray(msg.reputationLedger)) {
         this._seenReputationEntries = this._seenReputationEntries || new Set();
+        // Per-CONNECTION distinct-target rate limit: reputationLedger gossip
+        // requires no authentication binding a claimed entry.peerId to the
+        // connection reporting it (any message reaching this point — even a
+        // fully unsigned put to a plain, non-keychain soul — can carry a
+        // gossip payload), so without this bound a single first-contact
+        // connection could poison an unbounded number of victim peerIds in
+        // one payload or across many small ones. Bucketed per rolling window
+        // so a long-lived honest connection's gossip volume over time isn't
+        // permanently capped by an early burst.
+        let targetInfo = this._gossipTargetsByConn.get(connKey);
+        const now = Date.now();
+        if (!targetInfo || now - targetInfo.windowStart > this.REP_GOSSIP_WINDOW_MS) {
+          targetInfo = { targets: new Set(), windowStart: now };
+          this._gossipTargetsByConn.set(connKey, targetInfo);
+          if (this._gossipTargetsByConn.size > this.maxSeen) {
+            this._gossipTargetsByConn.delete(this._gossipTargetsByConn.keys().next().value);
+          }
+        }
         for (const entry of msg.reputationLedger) {
           // Number.isFinite (not just typeof === 'number') excludes
           // NaN/Infinity/-Infinity, and the magnitude clamp bounds a single
@@ -341,8 +441,24 @@ class Network {
           // permanently poison a peerId's reputation to -Infinity (matching
           // nevil.js's mergeReputationLedger, which already clamps the same way).
           if (!entry || typeof entry.peerId !== 'string' || typeof entry.delta !== 'number' || !Number.isFinite(entry.delta)) continue;
-          const delta = Math.max(-100, Math.min(100, entry.delta));
-          const entryKey = entry.peerId + '|' + entry.delta + '|' + entry.reason + '|' + entry.timestamp;
+          if (!targetInfo.targets.has(entry.peerId)) {
+            if (targetInfo.targets.size >= this.REP_GOSSIP_MAX_TARGETS) continue; // this connection already exhausted its per-window target budget
+            targetInfo.targets.add(entry.peerId);
+          }
+          // Gossip entries are unauthenticated hearsay (no proof the
+          // reporting connection actually observed entry.peerId's behavior),
+          // so the clamp is sized to the largest single LOCAL-observation
+          // delta (REP_DELTA_REPLAY, -5 by default) rather than the far
+          // larger +/-100 previously used — one gossip entry alone can no
+          // longer drive a neutral peerId straight past REP_DROP_THRESHOLD
+          // (-10 by default) in a single message.
+          const delta = Math.max(this.REP_GOSSIP_DELTA_MIN, Math.min(this.REP_GOSSIP_DELTA_MAX, entry.delta));
+          // Key on the CLAMPED delta, not entry.delta (raw) — otherwise many
+          // entries for the same peerId/reason/timestamp with distinct raw
+          // magnitudes that all clamp to the same effective value (e.g. 100,
+          // 150, 999999) each produce a distinct key, bypassing dedup and
+          // summing the same effective delta into reputationCache repeatedly.
+          const entryKey = entry.peerId + '|' + delta + '|' + entry.reason + '|' + entry.timestamp;
           if (this._seenReputationEntries.has(entryKey)) continue;
           this._seenReputationEntries.add(entryKey);
           if (this._seenReputationEntries.size > this.maxReputationLedger) {
@@ -432,6 +548,14 @@ class Network {
     if (this._directSendTargets.size > this.maxSeen) {
       this._directSendTargets.delete(this._directSendTargets.keys().next().value);
     }
+    // Record the original payload's digest so a later loop-back "ACK" for
+    // this id can be verified as a genuine re-delivery of THIS message
+    // (see handleMessage) rather than trusted on a bare {id} frame alone.
+    this._sentDigests = this._sentDigests || new Map();
+    this._sentDigests.set(msg.id, canonicalJSON({ soul: msg.soul, fields: msg.fields, ts: msg.ts }));
+    if (this._sentDigests.size > this.maxSeen) {
+      this._sentDigests.delete(this._sentDigests.keys().next().value);
+    }
     this._relay(msg, null);
     // DHT_FALLBACK_THRESHOLD ACK timeout: a DHT-routed (non-flood-fill) send
     // to a bounded peer subset is fire-and-forget with no receipt signal, so
@@ -454,8 +578,21 @@ class Network {
   }
 
   _isKeychainDerived(soul) {
-    // Check if soul looks like a hex Ed25519 public key (64 hex chars)
-    return /^[0-9a-f]{64}$/.test(soul);
+    // Explicit typeof guard, not just the regex: RegExp.test coerces its
+    // argument via String(x), so a non-string like a single-element array
+    // (e.g. ['a'.repeat(64)], a shape JSON.parse can legitimately produce
+    // from {"soul":["aaa...a"]}) can coerce to a valid-looking 64-hex string
+    // and return true, letting a non-string soul reach downstream code
+    // (_computeGeohash, _relayMultiHop) that assumes a real string and
+    // throws (soul.substring is not a function) — a real unauthenticated
+    // remote crash when dhtMultihopEnabled is on, since the multi-hop relay
+    // check has no msg.type === 'put' restriction to incidentally gate it.
+    // Case-insensitive to match keychain.js's own Keychain.fromPublicKey
+    // regex (/^[0-9a-fA-F]{64}$/) — casing must never affect whether a soul
+    // is treated as identity-addressed, since Buffer.from(hex,'hex') decodes
+    // upper/lowercase to the byte-identical key and an uppercase-hex put
+    // must not silently bypass the mandatory-signature gate above.
+    return typeof soul === 'string' && /^[0-9a-fA-F]{64}$/.test(soul);
   }
 
   _verifySignature(sender, msg, signature) {
@@ -490,7 +627,13 @@ class Network {
       // signed put fails verification at every hop past the first once
       // dhtMultihopEnabled mutates the message on relay.
       delete msgCopy._hops;
-      const msgBody = JSON.stringify(msgCopy, Object.keys(msgCopy).sort());
+      // canonicalJSON (not JSON.stringify(msgCopy, Object.keys(msgCopy).sort()))
+      // — the array-form replacer is a recursive key ALLOWLIST applied at
+      // every nesting level, so nested objects like `fields` always
+      // serialized as `{}` regardless of contents, meaning the signature
+      // never actually covered field data. Must stay byte-for-byte
+      // consistent with the signing side in nevil.js.
+      const msgBody = canonicalJSON(msgCopy);
       const sigBuf = Buffer.from(signature, 'hex');
       return sodium.crypto_sign_verify_detached(sigBuf, Buffer.from(msgBody), publicKeyBuf);
     } catch (e) {
@@ -528,27 +671,46 @@ class Network {
     return this.POW_DIFFICULTY;
   }
 
-  _verifyPoW(soul, pow, id) {
-    // Verify PoW: check that leading_zeros(sha256(soul || id || nonce)) >= difficulty.
+  /**
+   * Digest the payload a PoW puzzle is bound to, in addition to soul+id.
+   * Without this, `_verifyPoW` only ever hashed soul+id+nonce — `fields`/`ts`
+   * were never part of the puzzle, so a relaying peer could swap a plain
+   * (non-keychain, unsigned) put's actual data in transit while keeping the
+   * same valid PoW solution. Canonicalized (not plain JSON.stringify) so key
+   * order in `fields`/`ts` can't change the digest and desync solve/verify.
+   */
+  static _powPayloadDigest(fields, ts) {
+    const crypto = require('crypto');
+    return crypto.createHash('sha256').update(canonicalJSON({ fields: fields || {}, ts: ts || {} })).digest('hex');
+  }
+
+  _verifyPoW(soul, pow, id, fields, ts) {
+    // Verify PoW: check that leading_zeros(sha256(soul:id:payloadDigest:nonce)) >= difficulty.
     // Binding to `id` (a fresh random value per broadcast, already required
     // and dedup'd via _remember/`seen`) ties one solved puzzle to one
     // specific message — without it, a puzzle solved once for a soul could
     // be replayed unlimited times across distinct messages with fresh ids.
+    // Binding to a digest of `fields`/`ts` closes the relay-tampering gap on
+    // plain (non-keychain) souls, which have no signature to fall back on:
+    // a relaying peer can no longer swap the write's actual content while
+    // keeping the original valid PoW solution.
     if (!pow || typeof pow.nonce !== 'number' || typeof pow.difficulty !== 'number') return false;
     if (pow.difficulty < this.POW_DIFFICULTY) return false; // can't satisfy the gate with a weaker puzzle
     const crypto = require('crypto');
-    const input = soul + ':' + id + ':' + pow.nonce;
+    const payloadDigest = Network._powPayloadDigest(fields, ts);
+    const input = soul + ':' + id + ':' + payloadDigest + ':' + pow.nonce;
     const hash = crypto.createHash('sha256').update(input).digest('hex');
     const leadingZeros = hash.match(/^0*/)[0].length;
     return leadingZeros >= pow.difficulty;
   }
 
-  /** Solve a hashcash-style puzzle for `soul`+`id` at `difficulty` leading hex zeros. O(16^difficulty) expected iterations. */
-  static solvePoW(soul, difficulty, id) {
+  /** Solve a hashcash-style puzzle for `soul`+`id`+`fields`+`ts` at `difficulty` leading hex zeros. O(16^difficulty) expected iterations. */
+  static solvePoW(soul, difficulty, id, fields, ts) {
     const crypto = require('crypto');
+    const payloadDigest = Network._powPayloadDigest(fields, ts);
     let nonce = 0;
     for (;;) {
-      const hash = crypto.createHash('sha256').update(soul + ':' + id + ':' + nonce).digest('hex');
+      const hash = crypto.createHash('sha256').update(soul + ':' + id + ':' + payloadDigest + ':' + nonce).digest('hex');
       if (hash.match(/^0*/)[0].length >= difficulty) return { nonce, difficulty };
       nonce++;
     }
@@ -908,11 +1070,21 @@ class Network {
     if (this._queueDrainTimer.unref) this._queueDrainTimer.unref();
   }
 
-  /** Decide message throttle state: accept (>=REP_ACCEPT_THRESHOLD), queue ([REP_QUEUE_MIN, REP_ACCEPT_THRESHOLD)), or drop (<REP_QUEUE_MIN). */
+  /**
+   * Decide message throttle state: accept (>=REP_ACCEPT_THRESHOLD), drop
+   * (<REP_DROP_THRESHOLD), queue otherwise (the band between them).
+   * REP_DROP_THRESHOLD was previously assigned but never read here —
+   * REP_QUEUE_MIN alone silently did double duty as the real drop cutoff,
+   * leaving repDropThreshold a phantom config option with zero effect. Both
+   * default to -10, so this is a behavioral no-op for default config;
+   * explicitly using REP_DROP_THRESHOLD here makes repDropThreshold a
+   * genuinely live knob, matching AGENTS.md's documented Reputation Ledger
+   * config list. REP_QUEUE_MIN is no longer consulted here.
+   */
   getThrottleState(peerId) {
     const rep = this.getReputation(peerId);
     if (rep >= this.REP_ACCEPT_THRESHOLD) return 'accept';
-    if (rep < this.REP_QUEUE_MIN) return 'drop';
+    if (rep < this.REP_DROP_THRESHOLD) return 'drop';
     return 'queue';
   }
 
@@ -943,4 +1115,4 @@ class Network {
   }
 }
 
-module.exports = { Network, isNode, randomId };
+module.exports = { Network, isNode, randomId, canonicalJSON };

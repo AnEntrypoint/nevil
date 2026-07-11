@@ -83,7 +83,14 @@ class BTreeIndex {
   async _deleteSSTableFile(fileId) {
     if (!this.SSTABLE_DISK_ENABLED || fileId === undefined) return;
     const filePath = this.path.join(this.sstableDir, `sstable-${fileId}.json`);
-    try { await this.fs.promises.unlink(filePath); } catch { /* already gone */ }
+    try {
+      await this.fs.promises.unlink(filePath);
+    } catch (err) {
+      if (err?.code === 'ENOENT') return; // already gone — benign
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('BTreeIndex: failed to delete SSTable file', filePath, err?.message || err);
+      }
+    }
   }
 
   /**
@@ -168,7 +175,15 @@ class BTreeIndex {
   }
 
   /** Rebuild the whole index from a graph, carrying each node's real data/state. */
-  rebuild(graph) {
+  async rebuild(graph) {
+    // Tables still mid-flush (fire-and-forget disk persist from flushMemtable)
+    // have no _fileId yet — awaiting here first ensures every current table's
+    // _fileId is finalized before staleFileIds is computed below, otherwise an
+    // in-flight persist would land its file on disk *after* this.sstables has
+    // already been replaced, permanently orphaning it (never in staleFileIds,
+    // never referenced by the post-rebuild manifest either).
+    await Promise.all(this.sstables.map((t) => t._persistPromise).filter(Boolean));
+
     // Every table being cleared here may have a disk file from a prior flush;
     // rebuild() replaces them all with freshly-flushed tables under new file
     // ids, so the old files must be deleted or they leak on disk forever
@@ -185,12 +200,18 @@ class BTreeIndex {
       this.add(soul, { data: node.data, state: node.state, timestamp: maxTs });
     }
     if (staleFileIds.length) {
-      Promise.all(staleFileIds.map((id) => this._deleteSSTableFile(id))).catch((err) => {
+      await Promise.all(staleFileIds.map((id) => this._deleteSSTableFile(id))).catch((err) => {
         if (typeof console !== 'undefined' && console.error) {
           console.error('BTreeIndex: failed to delete stale SSTable file during rebuild', err?.message || err);
         }
       });
     }
+    // Rewrite the manifest unconditionally so it reflects the actual current
+    // this.sstables set once stale files are gone — add()-triggered flushes
+    // during the loop above may or may not have crossed the flush threshold,
+    // so this.sstableDir's manifest.json can otherwise keep referencing
+    // deleted fileIds indefinitely until an unrelated later flush overwrites it.
+    if (this.SSTABLE_DISK_ENABLED) await this._writeManifest();
   }
 
   /** Insert a flushed table in sorted position by minSoul. */
@@ -237,13 +258,29 @@ class BTreeIndex {
     }
   }
 
-  /** Get entry for a soul via memtable, then binary search over SSTables. */
+  /**
+   * Get entry for a soul: binary-search SSTables for a fast candidate, then
+   * always compare it (and any other table whose range contains the soul)
+   * against the memtable entry by timestamp — mirroring _collectPairs'
+   * timestamp-based dedup used by rangeScan/prefixScan. Two un-compacted
+   * SSTables can share the same minSoul (the same soul flushed twice before
+   * SSTABLE_MERGE_THRESHOLD merges them), and _insertSSTable's tie-break
+   * does not guarantee the newer of a tied pair sorts where the binary
+   * search below would land on it first — trusting the first hit
+   * unconditionally can return stale data. A plain memtable-always-wins
+   * shortcut has the same defect if the memtable ever holds an older
+   * timestamp for a soul than an already-flushed SSTable (e.g. after a
+   * rebuild() replay). Comparing timestamps across every candidate, exactly
+   * like the range/prefix scan path already does, keeps get() consistent
+   * with them on identical index state.
+   */
   get(soul) {
+    let best;
     const inMemtable = this.memtable.get(soul);
-    if (inMemtable) return inMemtable;
+    if (inMemtable) best = inMemtable;
 
     // sstables is sorted ascending by minSoul: find the rightmost table whose
-    // range can contain the soul, then confirm against its maxSoul.
+    // range can contain the soul as a fast-path candidate.
     let lo = 0;
     let hi = this.sstables.length - 1;
     let cand = -1;
@@ -260,21 +297,22 @@ class BTreeIndex {
       const t = this.sstables[cand];
       if (soul <= t.maxSoul) {
         const entry = t.index.get(soul);
-        if (entry) return entry;
+        if (entry && (!best || (entry.timestamp || 0) >= (best.timestamp || 0))) best = entry;
       }
     }
-    // Fallback linear scan: compaction merges tables by age, not always in a
-    // way that preserves strictly sorted, non-overlapping [minSoul, maxSoul]
-    // ranges relative to every other table (a merged table's new range can
-    // overlap an untouched neighbor at a lower index). The binary search
-    // above is the fast path for the common non-overlapping case; this scan
-    // guarantees correctness even if that invariant is ever violated.
+    // Compaction merges tables by age, not always in a way that preserves
+    // strictly sorted, non-overlapping [minSoul, maxSoul] ranges relative to
+    // every other table, and un-compacted flushes can leave multiple tables
+    // with overlapping/tied ranges for the same soul. The binary search
+    // above is a fast-path candidate, not the final answer: scan every table
+    // whose range could contain the soul and keep the newest entry, so a hit
+    // on one table never shadows a newer value sitting in another.
     for (const t of this.sstables) {
       if (soul < t.minSoul || soul > t.maxSoul) continue;
       const entry = t.index.get(soul);
-      if (entry) return entry;
+      if (entry && (!best || (entry.timestamp || 0) >= (best.timestamp || 0))) best = entry;
     }
-    return undefined;
+    return best;
   }
 
   /** Collect [soul, entry] pairs for souls in [start, end). */
@@ -320,22 +358,34 @@ class BTreeIndex {
     return this._collectPairs(prefix, end).filter(([soul]) => soul.startsWith(prefix));
   }
 
-  /** Prefix match: return sorted soul strings starting with prefix. */
+  /** Prefix match: return sorted, deduplicated soul strings starting with prefix. */
   prefixMatch(prefix) {
-    const out = [];
-    for (const soul of this.memtable.keys()) {
-      if (soul.startsWith(prefix)) out.push(soul);
-    }
-    for (const t of this.sstables) {
-      for (const soul of t.index.keys()) {
-        if (soul.startsWith(prefix)) out.push(soul);
-      }
-    }
-    return out.sort();
+    // A soul flushed to an SSTable and then rewritten (now sitting in the
+    // memtable, or in a newer SSTable after the older one hasn't compacted
+    // yet) must appear once, not once per source — reuse prefixScan's
+    // dedup instead of an independent two-loop-plus-sort with none.
+    return this.prefixScan(prefix).map(([soul]) => soul).sort();
   }
 
-  /** Merge the two oldest (by flush timestamp, not soul-range position) SSTables into one (newer entry wins on tie). */
-  async compactSSTables() {
+  /**
+   * Merge the two oldest SSTables into one. Serialized behind
+   * _compactionPromise (mirroring _writeManifest's _manifestWriteQueue):
+   * add() fires this unawaited on every flush past SSTABLE_MERGE_THRESHOLD,
+   * so a synchronous burst (boot replay, rebuild()'s per-soul loop) launches
+   * many overlapping calls that would otherwise all race for the same
+   * oldest-two-tables pair — only one survives per burst (indexOf-miss
+   * guard below no-ops the rest), leaving table count roughly proportional
+   * to burst size instead of converging toward the threshold. Chaining onto
+   * a single in-flight promise makes concurrent triggers run one-at-a-time
+   * instead of overlapping.
+   */
+  compactSSTables() {
+    this._compactionPromise = (this._compactionPromise || Promise.resolve())
+      .then(() => this._compactSSTablesOnce());
+    return this._compactionPromise;
+  }
+
+  async _compactSSTablesOnce() {
     if (this.sstables.length < 2) return;
 
     // `sstables` is sorted by minSoul for get()'s binary search, not by age —
@@ -428,7 +478,7 @@ class BTreeIndex {
       memtableEntries: this.memtable.size,
       memtableBytes: this.memtableSize,
       sstableCount: this.sstables.length,
-      totalSSTables: this.sstables.reduce((sum, t) => sum + t.index.size, 0),
+      totalSSTableEntries: this.sstables.reduce((sum, t) => sum + t.index.size, 0),
       sstableDetails: this.sstables.map((t, i) => ({
         index: i,
         entries: t.index.size,

@@ -64,22 +64,29 @@ async function run() {
   const netD = new Network({ peers: [`ws://localhost:8795/nevil`], powEnabled: true, powDifficulty: DIFFICULTY }, (msg) => netDReceived.push(msg));
   await waitMs(100);
 
-  // Honest: solves the puzzle bound to soul+id (PoW is bound to the specific
-  // message id, not just soul, so a puzzle can't be replayed across distinct
-  // messages — the id must be generated before solving, then reused on send).
+  // Honest: solves the puzzle bound to soul+id+fields+ts (PoW is bound to the
+  // specific message id AND its payload content, not just soul, so a puzzle
+  // can't be replayed across distinct messages, and a relaying peer can't
+  // swap fields/ts in transit while keeping the same valid solution — the id
+  // and payload must be fixed before solving, then reused unchanged on send).
   const soul = 'honest-soul';
   const msgId = randomId();
+  const fields = { ok: true };
+  const ts = { ok: Date.now() };
   const solveStart = Date.now();
-  const pow = Network.solvePoW(soul, DIFFICULTY, msgId);
+  const pow = Network.solvePoW(soul, DIFFICULTY, msgId, fields, ts);
   const puzzle_time_ms = Date.now() - solveStart;
 
   const verifyStart = Date.now();
-  const verified = netA._verifyPoW(soul, pow, msgId);
+  const verified = netA._verifyPoW(soul, pow, msgId, fields, ts);
   const verify_time_ms = Date.now() - verifyStart;
   assert.ok(verified, 'honest peer solved puzzle must verify');
 
+  const tampered = netA._verifyPoW(soul, pow, msgId, { ok: 'TAMPERED' }, ts);
+  assert.ok(!tampered, 'PoW solution must not verify against swapped fields content');
+
   const beforeHonest = netDReceived.length;
-  netC.broadcast({ id: msgId, type: 'put', soul, fields: { ok: true }, ts: { ok: Date.now() }, pow, sender: 'honest-peer', lamportClock: 2 });
+  netC.broadcast({ id: msgId, type: 'put', soul, fields, ts, pow, sender: 'honest-peer', lamportClock: 2 });
   await waitMs(300);
   const accepted = netDReceived.length > beforeHonest && netDReceived[netDReceived.length - 1].soul === soul;
   assert.ok(accepted, 'honest write with valid PoW must be accepted');

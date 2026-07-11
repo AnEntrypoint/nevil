@@ -97,7 +97,7 @@ const CONFLICT_STRATEGIES = {
 
 class Graph {
   constructor(opts = {}) {
-    // soul -> { field: value, ..., _meta: { field: { state: ts } } }
+    // soul -> { data: { field: value, ... }, state: { field: ts, ... }, lamport: { field: clock, ... } }
     this.nodes = new Map();
     this.listeners = new Map(); // soul -> Set<fn(node, changedFields)>
     this.wildcardListeners = new Set(); // fn(soul, node, changedFields)
@@ -110,6 +110,12 @@ class Graph {
     // here, since graph.js has no notion of peer connections.
     this.CLOCK_MAX_JUMP = opts.clockMaxJump || 1000; // max clock steps ahead
     this.MAX_FIELDS_PER_NODE = opts.maxFieldsPerNode || 1000; // caps synchronous per-message work
+    // Wall-clock counterpart to CLOCK_MAX_JUMP: bounds how far a field's HAM
+    // timestamp may sit ahead of our own Date.now() observation, so a
+    // Byzantine ts (e.g. Number.MAX_SAFE_INTEGER or Infinity) can't
+    // permanently win every future tie-break the way an unbounded lamport
+    // clock could before CLOCK_MAX_JUMP was enforced.
+    this.TS_MAX_JUMP_MS = opts.tsMaxJumpMs || 5 * 60 * 1000;
 
     // Conflict resolution strategy: 'lww' (default), 'fww', or a custom
     // fn(incomingTs, incomingVal, currentTs, currentVal, incomingLamport, currentLamport) -> boolean
@@ -229,25 +235,54 @@ class Graph {
       batchClock = this.localClock;
     }
 
+    // Per-field lamport clamp ceiling computed ONCE, before the loop, from
+    // the localClock value as it stood at message entry — not re-derived
+    // from this.localClock after each field, which would let a per-field
+    // 'staircase' map (field1: maxJump, field2: 2*maxJump, ...) advance
+    // localClock by ~fieldCount * CLOCK_MAX_JUMP in a single call instead of
+    // the documented single-message bound of CLOCK_MAX_JUMP.
+    const perFieldCeiling = this.localClock + this.CLOCK_MAX_JUMP;
+    let maxAcceptedClock = this.localClock;
+    // Wall-clock ceiling mirrors the lamport ceiling: bounds how far ahead
+    // of our own Date.now() a field's incoming ts may sit, computed once so
+    // it can't be walked forward field-by-field either.
+    const tsCeiling = Date.now() + this.TS_MAX_JUMP_MS;
+
     const changed = [];
     for (const field of fieldNames) {
       const ts = timestamps[field];
+      if (!Number.isFinite(ts)) {
+        this._warnRejected(`field '${field}' has a non-finite timestamp, skipping`);
+        continue;
+      }
+      const clampedTs = ts > tsCeiling ? tsCeiling : ts;
+
       let incomingClock = perField ? lamportClock[field] : batchClock;
+      if (perField && incomingClock !== undefined && !Number.isFinite(incomingClock)) {
+        this._warnRejected(`field '${field}' has a non-finite lamport clock, skipping`);
+        continue;
+      }
       // Byzantine clock guard: a peer advertising an implausibly large jump
       // ahead of our own clock would otherwise win every future HAM
       // comparison for this field forever (CLOCK_MAX_JUMP was previously
       // declared but never enforced). Clamp the accepted clock to at most
-      // CLOCK_MAX_JUMP past our current localClock so one malicious message
+      // CLOCK_MAX_JUMP past our localClock-at-entry so one malicious message
       // can't permanently poison a field's conflict-resolution ordering.
-      if (incomingClock !== undefined && incomingClock > this.localClock + this.CLOCK_MAX_JUMP) {
-        incomingClock = this.localClock + this.CLOCK_MAX_JUMP;
+      if (incomingClock !== undefined && incomingClock > perFieldCeiling) {
+        incomingClock = perFieldCeiling;
       }
-      if (perField && incomingClock !== undefined && incomingClock > this.localClock) this.localClock = incomingClock;
+      if (perField && incomingClock !== undefined && incomingClock > maxAcceptedClock) {
+        maxAcceptedClock = incomingClock;
+      }
       const currentLamport = this.nodes.get(soul)?.lamport[field];
-      if (this.mergeField(soul, field, fields[field], ts, incomingClock, currentLamport)) {
+      if (this.mergeField(soul, field, fields[field], clampedTs, incomingClock, currentLamport)) {
         changed.push(field);
       }
     }
+    // Advance localClock at most once after the loop, to the highest clamped
+    // value actually observed — mirrors the scalar/batch branch's single
+    // pre-loop advance instead of mutating localClock inside the loop.
+    if (perField && maxAcceptedClock > this.localClock) this.localClock = maxAcceptedClock;
     if (changed.length) this._notify(soul, changed);
     return changed;
   }
@@ -298,32 +333,31 @@ class Graph {
     return () => this.wildcardListeners.delete(fn);
   }
 
+  /**
+   * Each listener runs in its own try/catch: this fires synchronously inside
+   * mergeNode/put, which itself runs synchronously inside network.js's raw
+   * ws.on('message', ...) handler with no surrounding try/catch there — an
+   * uncaught throw from one subscriber would otherwise propagate all the way
+   * out and crash the process on the next inbound message it touches, and
+   * would also prevent every OTHER subscriber (and the caller's post-merge
+   * relay logic) from running at all.
+   */
   _notify(soul, changedFields) {
     const node = this.get(soul);
-    this.listeners.get(soul)?.forEach((fn) => fn(node, changedFields));
-    this.wildcardListeners.forEach((fn) => fn(soul, node, changedFields));
-  }
-
-  /** Serialize the whole graph (used by storage snapshotting). */
-  toJSON() {
-    const out = {};
-    for (const [soul, node] of this.nodes) {
-      out[soul] = { data: node.data, state: node.state, lamport: node.lamport };
-    }
-    return out;
-  }
-
-  /** Load a previously serialized graph (used by storage on boot). */
-  static fromJSON(obj) {
-    const g = new Graph();
-    for (const soul of Object.keys(obj || {})) {
-      g.nodes.set(soul, {
-        data: obj[soul].data || {},
-        state: obj[soul].state || {},
-        lamport: obj[soul].lamport || {},
-      });
-    }
-    return g;
+    this.listeners.get(soul)?.forEach((fn) => {
+      try {
+        fn(node, changedFields);
+      } catch (err) {
+        this._warnRejected(`listener for soul '${soul}' threw: ${err?.message || err}`);
+      }
+    });
+    this.wildcardListeners.forEach((fn) => {
+      try {
+        fn(soul, node, changedFields);
+      } catch (err) {
+        this._warnRejected(`wildcard listener threw: ${err?.message || err}`);
+      }
+    });
   }
 }
 

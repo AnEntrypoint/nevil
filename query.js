@@ -61,6 +61,16 @@ function compareSortKeys(av, bv, sortOrder) {
 
 const FILTER_OPERATORS = new Set(['$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$in']);
 
+// A nested-selection alias is always a plain object carrying `via` and/or
+// `select`/`list`/etc — none of the reserved query directives' real values
+// (filter conditions, sort specs, numbers, arrays, strings, booleans) are ever
+// shaped like that. Used to tell "caller's directive value" apart from "a
+// same-named field the caller chose as a nested-selection alias key" wherever
+// a reserved key's value is consulted, not just in the alias-skip loop.
+function isAliasShaped(v) {
+  return !!v && typeof v === 'object' && !Array.isArray(v) && ('via' in v || 'select' in v || 'list' in v);
+}
+
 function applyFilter(node, filter) {
   if (!filter) return true;
   if (!node) return false;
@@ -105,7 +115,13 @@ function resolveOne(graph, soul, q, depth, maxDepth) {
   // per sub-query object: a nested selection with no maxDepth of its own
   // must inherit the caller's configured bound, not silently reset to the
   // 32 default (which would defeat a caller's intent to cap total depth).
-  if (maxDepth === undefined) maxDepth = q.maxDepth != null ? q.maxDepth : 32;
+  if (maxDepth === undefined) {
+    // A non-numeric q.maxDepth (e.g. an object used as a nested-selection
+    // alias, or a typo'd non-number) must not silently defeat the cutoff by
+    // making `depth > maxDepth` compare against NaN (always false) — fall
+    // back to the 32 default instead of trusting an invalid override.
+    maxDepth = typeof q.maxDepth === 'number' && q.maxDepth >= 0 ? q.maxDepth : 32;
+  }
   const node = graph.get(soul);
   if (depth > maxDepth) {
     // A node that the active filter would exclude must still be excluded at
@@ -113,25 +129,44 @@ function resolveOne(graph, soul, q, depth, maxDepth) {
     // let a filtered-out node leak into results exactly at the maxDepth
     // boundary, since applyFilter was previously only reached in the
     // non-cutoff branch below.
-    if (!applyFilter(node, q.filter)) return null;
+    if (!isAliasShaped(q.filter) && !applyFilter(node, q.filter)) return null;
     // Include the node's own requested scalar fields at the cutoff so a
     // caller can't misread "field omitted" as "field is empty" — only
-    // further nested traversal is actually truncated here.
-    return { soul, _depthExceeded: true, ...selectScalars(node, q.select) };
+    // further nested traversal is actually truncated here. selectScalars is
+    // spread FIRST so the engine's own soul/_depthExceeded control fields
+    // always win over a same-named field in the node's own data.
+    return { ...selectScalars(node, q.select), soul, _depthExceeded: true };
   }
   if (!node) return null;
 
-  if (!applyFilter(node, q.filter)) return null;
+  if (!isAliasShaped(q.filter) && !applyFilter(node, q.filter)) return null;
 
-  const out = { soul, ...selectScalars(node, q.select) };
+  // selectScalars spread first: the true soul identifier must win over a
+  // node field literally named `soul` included in q.select, never be
+  // silently overwritten by it. q.select itself may be alias-shaped (used as
+  // a nested-selection key rather than the scalar-fields directive), in which
+  // case there is no real select list to apply here.
+  const out = { ...selectScalars(node, isAliasShaped(q.select) ? undefined : q.select), soul };
 
   for (const key of Object.keys(q)) {
-    // Reserved query-directive keys, not resolvable as a nested-selection alias.
-    // `souls` is only reserved when it holds the root multi-soul array (the shape
-    // query() passes straight into resolveOne as `q`) — a caller-chosen nested
-    // field literally named `souls` with an object value is a legitimate alias
-    // and must still resolve, so it is excluded from this list, not added to it.
-    if (key === 'soul' || (key === 'souls' && Array.isArray(q.souls)) || key === 'select' || key === 'via' || key === 'list' || key === 'filter' || key === 'sort' || key === 'limit' || key === 'offset') continue;
+    // Reserved query-directive keys, not resolvable as a nested-selection alias
+    // UNLESS the value at that key doesn't match the directive's own expected
+    // shape — in which case a caller-chosen nested field of the same name is a
+    // legitimate alias and must still resolve. Each directive's expected shape:
+    // `souls`/`select` -> array, `filter`/`sort` -> plain non-alias object or
+    // string, `via` -> string, `list` -> boolean, `limit`/`offset`/`maxDepth`
+    // -> number, `mapToRows` -> boolean.
+    if (key === 'soul') continue;
+    if (key === 'souls' && Array.isArray(q.souls)) continue;
+    if (key === 'select' && Array.isArray(q.select)) continue;
+    if (key === 'via' && typeof q.via === 'string') continue;
+    if (key === 'list' && typeof q.list === 'boolean') continue;
+    if (key === 'filter' && !isAliasShaped(q.filter)) continue;
+    if (key === 'sort' && !isAliasShaped(q.sort)) continue;
+    if (key === 'limit' && typeof q.limit === 'number') continue;
+    if (key === 'offset' && typeof q.offset === 'number') continue;
+    if (key === 'maxDepth' && typeof q.maxDepth === 'number') continue;
+    if (key === 'mapToRows' && typeof q.mapToRows === 'boolean') continue;
     const sub = q[key];
     if (!sub || typeof sub !== 'object') continue;
 
@@ -216,7 +251,7 @@ function query(graph, q) {
       results = results.slice(0, q.limit);
     }
 
-    if (q.mapToRows) {
+    if (q.mapToRows === true) {
       return results.map((r) => {
         const row = { ...r };
         delete row.soul;
@@ -230,7 +265,7 @@ function query(graph, q) {
   const result = resolveOne(graph, q.soul, q, 0);
   if (result === null) return null;
 
-  if (q.mapToRows) {
+  if (q.mapToRows === true) {
     const row = { ...result };
     delete row.soul;
     return row;

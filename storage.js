@@ -44,7 +44,7 @@ class NodeLogStore {
     // ordering guarantee relative to each other, so a fast local write racing
     // an applied remote write could land out of logical order in the log,
     // diverging replay order from live merge order on next boot.
-    this._writeQueue = (this._writeQueue || Promise.resolve()).then(async () => {
+    const queue = (this._writeQueue || Promise.resolve()).then(async () => {
       // fsyncOnWrite trades throughput for surviving an OS-level crash (not just
       // a process crash — the append-only+torn-line format already handles
       // that): without it, the last buffered-but-unflushed write can be lost.
@@ -60,7 +60,14 @@ class NodeLogStore {
         await this.fs.promises.appendFile(this.filePath, lines, 'utf8');
       }
     });
-    await this._writeQueue;
+    // Reset the queue head to a resolved promise on failure — otherwise a
+    // single rejected write (disk full, EMFILE, transient permission error)
+    // becomes the permanent chain head, and every future append/compact
+    // rejects immediately without ever touching the filesystem again, even
+    // after the underlying I/O problem clears. The original rejection still
+    // propagates to THIS call's awaiter via the un-reset `queue` reference.
+    this._writeQueue = queue.catch(() => {});
+    await queue;
   }
 
   async readAll() {
@@ -84,8 +91,11 @@ class NodeLogStore {
     // Route through the same _writeQueue as appendEntries() — otherwise a
     // concurrent in-flight append and this unqueued writeFile race at the OS
     // level, losing the append entirely or corrupting the log's trailing bytes.
-    this._writeQueue = (this._writeQueue || Promise.resolve()).then(() => this.fs.promises.writeFile(this.filePath, lines, 'utf8'));
-    await this._writeQueue;
+    const queue = (this._writeQueue || Promise.resolve()).then(() => this.fs.promises.writeFile(this.filePath, lines, 'utf8'));
+    // Same poisoning-recovery reset as appendEntries(): a failed compact must
+    // not permanently disable every future append/compact on this store.
+    this._writeQueue = queue.catch(() => {});
+    await queue;
   }
 
   /** No file handle is held open between writes (each appendFile/writeFile call opens and closes its own), so there is nothing to release — present for interface parity with BrowserLogStore.close(). */
@@ -118,8 +128,11 @@ class BrowserLogStore {
       tx.onerror = () => reject(tx.error);
     }));
     // Same ordering guarantee as NodeLogStore: serialize concurrent appends.
-    this._writeQueue = (this._writeQueue || Promise.resolve()).then(run);
-    return this._writeQueue;
+    const queue = (this._writeQueue || Promise.resolve()).then(run);
+    // Reset on failure — see NodeLogStore.appendEntries for why an unguarded
+    // reassignment here would permanently poison every future write.
+    this._writeQueue = queue.catch(() => {});
+    return queue;
   }
 
   async readAll() {
@@ -143,8 +156,11 @@ class BrowserLogStore {
       tx.onerror = () => reject(tx.error);
     }));
     // Same ordering guarantee as appendEntries(): serialize against any in-flight append.
-    this._writeQueue = (this._writeQueue || Promise.resolve()).then(run);
-    return this._writeQueue;
+    const queue = (this._writeQueue || Promise.resolve()).then(run);
+    // Reset on failure — see NodeLogStore.appendEntries for why an unguarded
+    // reassignment here would permanently poison every future write.
+    this._writeQueue = queue.catch(() => {});
+    return queue;
   }
 
   /** Release the open IndexedDB connection — without this, a discarded Storage/Nevil instance leaks a connection for the page's lifetime, which can block a later indexedDB.deleteDatabase() or a version-upgrade open from another tab. */
@@ -224,6 +240,17 @@ class Storage {
     // to backfill souls the disk snapshot missed.
     if (this.index) await this.index.loadFromDisk();
     for (const entry of entries) {
+      if (typeof entry?.soul !== 'string' || !entry.soul) {
+        // A non-string/empty soul (undefined, number, etc.) is not a torn
+        // line (JSON.parse succeeded) — it's a malformed entry that must
+        // never be allowed to key a graph node, or it durably round-trips
+        // through every future persist/load cycle. Skip + warn, same
+        // pattern as the catch-block below for unexpected replay errors.
+        if (typeof console !== 'undefined' && console.warn) {
+          console.warn('storage.load: skipping log entry with invalid soul', entry?.soul);
+        }
+        continue;
+      }
       try {
         g.mergeNode(entry.soul, entry.fields, entry.ts, entry.lamportClock);
         if (this.index) {
@@ -248,6 +275,11 @@ class Storage {
 
   /** Persist a batch of graph writes (called after every accepted merge). Carries the field-level lamportClock map so a future boot replays real causal order, not a re-inflated local count. */
   async persist(soul, fields, ts, lamportClock) {
+    // Reject before appending — a non-string/empty soul (e.g. undefined,
+    // which JSON.stringify silently drops from the object entirely) would
+    // otherwise write a garbage-keyed entry that durably round-trips through
+    // load() and pollutes graph.nodes on every future boot.
+    if (typeof soul !== 'string' || !soul) throw new TypeError('storage.persist: soul must be a non-empty string');
     await this.log.appendEntries([{ soul, fields, ts, lamportClock }]);
     if (this.index) {
       const maxTs = ts ? maxOf(Object.values(ts)) : Date.now();
@@ -316,14 +348,21 @@ class Storage {
       }
       entries.push({ soul, fields: node.data, ts: node.state, lamportClock: node.lamport });
     }
+    // Persist FIRST, delete from live graph.nodes only after that succeeds —
+    // otherwise a failed log.compact() (disk full, permission error) leaves
+    // memory ahead of disk: the soul vanishes from the running process while
+    // the still-intact on-disk log (never successfully rewritten) still
+    // contains it, so a reload from that same log would resurrect it. A
+    // thrown compact() must never durably diverge in-memory state from what
+    // was actually committed.
+    await this.log.compact(entries);
     // Purged souls are deleted from graph.nodes here; the unconditional
     // index.rebuild(graph) below (not an incremental per-soul removal — no
     // such method exists on BTreeIndex) is what actually drops them from
     // the index, since it rebuilds from the already-purged graph.nodes.
     for (const soul of purgedSouls) graph.nodes.delete(soul);
-    await this.log.compact(entries);
     if (this.index) {
-      this.index.rebuild(graph);
+      await this.index.rebuild(graph);
       this.index.flushMemtable();
       if (this.index.sstables.length >= this.index.SSTABLE_MERGE_THRESHOLD) {
         this.index.compactSSTables();

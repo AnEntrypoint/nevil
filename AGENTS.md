@@ -52,10 +52,11 @@ All design decisions hold against formal constraints (`.gm/constraints.md`). 32 
 - `get(soul)` — read node
 - `on(soul, callback)` — listen for changes
 - `link(soul, field, targetSoul)` — create reference
+- `resolve(soul, field)` — dereferences `field` on `soul`: returns the referenced node (via `get()`) if the field is a soul-reference, the plain value otherwise, or `undefined` if `soul` doesn't exist
 - `putTxn(soul, fields)` / `getTxn(soul)` — multi-field write with a crash-durability marker (`_txnComplete`); `getTxn` returns `undefined` if the marker is missing, so a reader never treats a torn/partial write as a confirmed logical unit. In-memory atomicity (no reader ever observes a partial `put()` mid-write) already held for plain `put`/`putAt`/`batchWrite` — verified via exec_js, not something `putTxn` needed to add; `putTxn` closes the separate crash-during-persist durability gap.
 
 ### Identity & Auth
-- `createIdentity({ passphrase })` — create root keychain (returns {soul, keychain})
+- `createIdentity({ passphrase })` — create root keychain (returns {soul, keychain}); the account's own root profile node is written via plain `put()`, NOT `putAt()` — it carries no `_owner`/`_path` custody markers, so `getAtVerified(identitySoul)` always returns `undefined` for a fresh identity's own profile even though `get(identitySoul)` returns the real data. This is intentional/documented, not a bug: `getAtVerified` is for verifying signed writes made under an identity via `putAt`, not the identity's own bootstrap profile; read the root profile via plain `get()`
 - `unlock(soul, passphrase)` — recover keychain elsewhere
 - `capability(soul)` — public-key-only (read/verify, no sign)
 - `putAt(path, fields)` — signed write under keychain path
@@ -74,8 +75,8 @@ All design decisions hold against formal constraints (`.gm/constraints.md`). 32 
 - `network._computeGeohash(soul)` — deterministic geohash bucketing
 - `network.updatePeerHealth(peerId, latency, loss)` — track peer health scores
 - `network.getHealthyPeers()` — retrieve peers sorted by health
-- `network.broadcast(payload, lamportClock)` — starts a `dhtFallbackThreshold` timer; if the message id is never observed looping back through the mesh (the real receipt signal) within the threshold, it force-reflloods to every connected peer instead of staying confined to the original DHT-selected subset. Skips arming the timer entirely when the initial DHT selection already targeted every connected socket (e.g. a small/fully-connected mesh) — a reflood there would be a guaranteed duplicate send, since a message can never loop back in a mesh where recipients don't relay to their own sender
-- Config: `dhtK`, `dhtL`, `dhtGeohashLength`, `dhtHealthUpdateFreq`, `dhtFallbackThreshold`, `dhtEnabled`
+- `network.broadcast(payload, lamportClock)` — starts a `dhtFallbackThreshold` timer; if the message id is never observed looping back through the mesh (the real receipt signal) within the threshold, it force-reflloods to every connected peer instead of staying confined to the original DHT-selected subset. Skips arming the timer entirely when the initial DHT selection already targeted every connected socket (e.g. a small/fully-connected mesh) — a reflood there would be a guaranteed duplicate send, since a message can never loop back in a mesh where recipients don't relay to their own sender. The loop-back "ACK" itself is authenticated against a digest of the originally-broadcast `soul`/`fields`/`ts` recorded at send time — a bare `{id}` echo from a peer that never actually re-relayed the real message body can no longer forge the ACK signal and suppress the fallback reflood
+- Config: `dhtK`, `dhtL`, `dhtGeohashLength`, `dhtHealthUpdateFreq`, `dhtFallbackThreshold`, `dhtEnabled`, `dhtHealthAverageWindow` (default 100 — bounds the moving-average sample count used by `updatePeerHealth()`, so a long-lived connection's health score stays responsive to recent latency/loss instead of an ever-growing denominator)
 
 ### Lamport Clocks (Transcendence 2: Causal consistency)
 - `graph.localClock` — monotonically incrementing clock counter
@@ -90,10 +91,13 @@ All design decisions hold against formal constraints (`.gm/constraints.md`). 32 
 - `network.getThrottleState(peerId)` — accept/queue/drop decision
 - `network.isByzantineIsolated(peerId, threshold)` — check if isolated
 - Delta reasons: 'good', 'malformed', 'replay', 'byzantine', 'routing-help'
-- Config: `repAcceptThreshold`, `repQueueMin`, `repDropThreshold`, `repDelta*`, `queueRetryDelay`, `queueMaxRetries`
+- Config: `repAcceptThreshold`, `repDropThreshold`, `repDelta*`, `queueRetryDelay`, `queueMaxRetries` — `getThrottleState` is accept (`>= repAcceptThreshold`) / drop (`< repDropThreshold`) / queue (the band between); `repQueueMin` does not exist as a separate knob (removed as dead — it previously silently did the drop-cutoff job `repDropThreshold`'s name and docs already claimed)
 - Messages from a `queue`-throttled sender are held in `network.messageQueue` (bounded FIFO, `maxQueuedMessages`) and actively drained by `network._drainQueue()` on a `queueRetryDelay` timer: each retry re-checks the sender's current throttle state, delivering once reputation recovers to `accept` and dropping after `queueMaxRetries` if it never does
 - Gossip of the reputation ledger (`nevil.js` attaching it to every `put` broadcast) sends only the delta slice accrued since the last gossip, not the full ledger; receivers dedup incoming entries by identity before summing into `reputationCache`, so a re-delivered message can't double-count the same historical delta
+- Incoming `reputationLedger` gossip entries are unauthenticated hearsay (any message reaching that point in `handleMessage` can carry one, including a fully unsigned put to a plain non-keychain soul — there is no proof binding a claimed `entry.peerId` to the reporting connection's real observations), so each entry is clamped to a narrower band than a locally-observed delta and the number of distinct `peerId` targets one connection may gossip about is rate-limited per window: `repGossipDeltaMin`/`repGossipDeltaMax` (default -5/10, matching the largest single local-observation delta magnitudes rather than the old flat +/-100), `repGossipMaxTargets` (default 20 distinct peerIds per connection per window), `repGossipWindowMs` (default 60000)
 - `nevil.mergeReputationLedger(entries)` validates `peerId`/`delta` shape and clamps both the delta magnitude and the accepted lamport-clock jump before applying — a malformed or hostile entry can't blacklist an arbitrary peer or inflate the global clock unboundedly
+- `nevil.addReputation(peerId, delta, reason)` — composite-level write: advances `nevil._lamportClock`, delegates to `network.updateReputation`, and additionally persists the entry onto the graph at soul `['reputation', peerId].join(':')` for visibility (beyond what the lower-level `network.updateReputation` alone does); checks this instance's quorum gate (same as `put()`) before touching the network ledger at all, so a CA-topology call that would fail the graph-mirroring `put()` never partially commits a network-side delta with no way to roll it back
+- `nevil.getReputationLedger(peerId)` — full `network.reputationLedger` array if `peerId` is omitted, or that peer's filtered entries if given; NOTE this omitted-arg behavior differs from `network.getReputationLedger(peerId)` itself, which always filters and returns `[]` for an omitted `peerId`
 - `network.reputationCache` (the `peerId -> cumulative score` Map) is FIFO-bounded by `maxReputationLedger` the same as `seen`/`reputationLedger`, via `_setReputationCache()` at every write site — a peer gossiping a stream of fabricated `peerId`s can't grow the cache without limit
 
 ### Configurable Conflict Resolution (Transcendence 5: pluggable HAM strategy)
@@ -118,8 +122,8 @@ All design decisions hold against formal constraints (`.gm/constraints.md`). 32 
 - Witness: `tools/witness-encrypt-for-recipient.js` asserts a sender holding only the published key can seal, the correct recipient can open, a different derived sub-address cannot, and a read-only (scalar-less) capability cannot
 
 ### Proof-of-Work Rate-Limiting (Transcendence 7: optional hashcash-style throttle)
-- `Network.solvePoW(soul, difficulty)` — static; iterates nonces until `sha256(soul + ':' + nonce)` has `difficulty` leading hex zeros, returns `{ nonce, difficulty }`
-- `network._verifyPoW(soul, pow)` — O(1) hash check; rejects `pow.difficulty` weaker than the network's configured minimum
+- `Network.solvePoW(soul, difficulty, id, fields, ts)` — static; iterates nonces until `sha256(soul + ':' + id + ':' + sha256(canonicalJSON({fields,ts})) + ':' + nonce)` has `difficulty` leading hex zeros, returns `{ nonce, difficulty }`
+- `network._verifyPoW(soul, pow, id, fields, ts)` — O(1) hash check; rejects `pow.difficulty` weaker than the network's configured minimum; `id` binds the puzzle to one specific message so it cannot be replayed across distinct messages for the same soul, and binding a digest of `fields`/`ts` closes a relay-tampering gap on plain (non-keychain, unsigned) souls — without it a relaying peer could swap a write's actual content in transit while keeping the original valid PoW solution, since PoW is the only per-message integrity check on souls with no signature to fall back on
 - `new Network({ powEnabled: true, powDifficulty: N })` — when `powEnabled`, every `type: 'put'` message must carry a valid `pow` field or is dropped and its sender penalized in the reputation ledger (same as a Byzantine write); when a `pow` field is present but `powEnabled` is false, it is still verified if given (never trust unchecked work)
 - Orthogonal to the reputation ledger: PoW gates admission per-message: reputation gates a peer's ongoing throughput
 - Config: `powEnabled` (default false), `powDifficulty` (default 4)
@@ -215,9 +219,10 @@ All 32 formal constraints documented in `.gm/constraints.md`. Verified: idempote
 ## Configuration & Tuning
 
 All magic constants exposed via constructor options (no hidden defaults):
-- Network: DHT_K, DHT_L, DHT_GEOHASH_LENGTH, DHT_HEALTH_UPDATE_FREQ, DHT_FALLBACK_THRESHOLD, DHT_ENABLED
+- Network: DHT_K, DHT_L, DHT_GEOHASH_LENGTH, DHT_HEALTH_UPDATE_FREQ, DHT_FALLBACK_THRESHOLD, DHT_ENABLED, `dhtHealthAverageWindow` (default 100)
+- Network transport: `maxPayloadBytes` (default 1MB — caps the raw WebSocket frame size at both `WebSocketServer` and client-dial sites, independent of/orthogonal to `graph.js`'s field-count cap `maxFieldsPerNode`), `redialBaseMs`/`redialMaxMs` (default 2000ms/60000ms — base/cap for `_redialDelay()`'s exponential-backoff reconnect scheduling of a configured peer that disconnects)
 - Graph: CLOCK_MAX_JUMP
-- Reputation: REP_*_THRESHOLD, REP_DELTA_*, QUEUE_RETRY_DELAY, QUEUE_MAX_RETRIES
+- Reputation: `repAcceptThreshold`, `repDropThreshold`, `repDelta*`, `queueRetryDelay`, `queueMaxRetries`
 - Storage: MEMTABLE_SIZE_LIMIT, MEMTABLE_FLUSH_FREQ, SSTABLE_MERGE_THRESHOLD, `fsyncOnWrite`, `sstableDiskEnabled`, `sstableDir`, `peerTableSaveFreq`
 - Graph: also `withSoulLock` (per-soul async serialization, opt-in usage not a constructor flag)
 - Reputation: also `compactReputationLog()` (call periodically, mirrors `nevil.compact()`)

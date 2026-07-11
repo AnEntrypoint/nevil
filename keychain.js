@@ -108,11 +108,14 @@ function checkSodiumHealth() {
 }
 checkSodiumHealth();
 
+// Numbers get a leading 0x00 type-tag byte so a numeric label (e.g. sub(42))
+// can never collide with its string form (sub('42')) -- both would otherwise
+// reduce to the identical UTF-8 bytes and derive the same child address.
 function toBuf(x) {
   if (Buffer.isBuffer(x)) return x;
   if (x instanceof Uint8Array) return Buffer.from(x.buffer, x.byteOffset, x.byteLength);
   if (typeof x === 'string') return Buffer.from(x, 'utf8');
-  if (typeof x === 'number') return Buffer.from(String(x), 'utf8');
+  if (typeof x === 'number') return Buffer.concat([Buffer.from([0]), Buffer.from(String(x), 'utf8')]);
   throw new TypeError('expected Buffer, Uint8Array, string, or number');
 }
 
@@ -135,8 +138,15 @@ class KeyPair {
     return sig;
   }
 
+  /** Returns false (never throws) for a malformed signature -- e.g. sodium asserts on a
+   * signature shorter than crypto_sign_BYTES, which is untrusted-input shaped (any graph
+   * node's stored sig), not a programmer error, so it must fail closed like a bad signature. */
   verify(message, signature) {
-    return sodium.crypto_sign_verify_detached(toBuf(signature), toBuf(message), this.publicKey);
+    try {
+      return sodium.crypto_sign_verify_detached(toBuf(signature), toBuf(message), this.publicKey);
+    } catch {
+      return false;
+    }
   }
 
   /**
