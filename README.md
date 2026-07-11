@@ -358,7 +358,7 @@ Eleven limitations have been reclassified as in-scope and fully implemented. Not
 - **Gossip convergence:** Ledger included in network broadcasts; peers merge via reputation tracking
 - **Recovery:** Peers can earn reputation back via good behavior (+1 per good message, +10 for routing help)
 
-**Implementation:** `updateReputation(peerId, delta, reason)`, `getReputation(peerId)`, `getThrottleState(peerId)`, `isByzantineIsolated(peerId)`. Message handler checks throttle state before processing (the `handleMessage` closure inside `_attach()`, network.js:355-379 for the sender-keyed accept/queue/drop branch, plus a cheaper connection-keyed drop-only pre-check at network.js:249 before signature/PoW work is spent). Convergence time: < 1 second on 10-peer network. Witness: `tools/witness-reputation-ledger.js` validates all delta rules and throttle states.
+**Implementation:** `updateReputation(peerId, delta, reason)`, `getReputation(peerId)`, `getThrottleState(peerId)`, `isByzantineIsolated(peerId)`. Message handler checks throttle state before processing (the `handleMessage` closure inside `_attach()`, network.js:521-538 for the sender-keyed accept/queue/drop branch, plus a cheaper connection-keyed drop-only pre-check at network.js:353 before signature/PoW work is spent). Convergence time: < 1 second on 10-peer network. Witness: `tools/witness-reputation-ledger.js` validates all delta rules and throttle states.
 
 **Guarantee:** Gossip convergence to consistent reputation state across all peers. No central authority. Byzantine peers gradually isolated via reputation decay. The ledger is also durably persisted (dedicated append-only log, separate from the graph log) and replayed on boot, so a restart doesn't reset a Byzantine peer back to neutral — see Transcendence 11.
 
@@ -448,7 +448,7 @@ All eleven prior limitations have been reclassified as in-scope and fully implem
 ### 7. **No Spam Resistance → Optional Proof-of-Work** (Transcendence 7)
 **Problem:** The reputation ledger throttles *after* observing bad behavior; there was no admission-control gate to make spam itself costly.
 
-**Solution:** `Network({ powEnabled, powDifficulty })`, off by default. When enabled, every `put` message must carry a valid hashcash-style solved puzzle (`sha256(soul + nonce)` with N leading hex zeros) or is dropped and its sender penalized in the reputation ledger. Orthogonal to and composable with reputation (PoW gates per-message; reputation gates per-peer throughput over time).
+**Solution:** `Network({ powEnabled, powDifficulty })`, off by default. When enabled, every `put` message must carry a valid hashcash-style solved puzzle (`sha256(soul + ':' + id + ':' + sha256(canonicalJSON({fields,ts})) + ':' + nonce)` with N leading hex zeros) or is dropped and its sender penalized in the reputation ledger. Binding to `id` prevents replaying a solved puzzle across distinct messages; binding to a digest of `fields`/`ts` closes a relay-tampering gap on plain (non-keychain) souls, which have no signature to fall back on. Orthogonal to and composable with reputation (PoW gates per-message; reputation gates per-peer throughput over time).
 
 **Implementation:** `network.js` `Network.solvePoW()` (static solver), `_verifyPoW()` (O(1) check), message-handler enforcement gate; `nevil.js` attaches a solved puzzle to outbound writes when enabled. Witness: `tools/witness-proof-of-work.js` asserts unsolved writes are rejected and solved writes accepted, with real solve/verify timing over live loopback sockets.
 

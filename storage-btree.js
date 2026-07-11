@@ -194,11 +194,38 @@ class BTreeIndex {
     this.memtable.clear();
     this.memtableSize = 0;
     this.sstables = [];
+    // Use write()/flushMemtable()/compactSSTables() directly instead of
+    // add(): add() is designed for live traffic where its fire-and-forget
+    // disk persist can safely outlive the caller. rebuild() instead needs to
+    // know about and await every persist ITS OWN loop triggers before it
+    // writes the final manifest below — otherwise a loop-triggered flush's
+    // _persistSSTable (which itself calls _writeManifest once the file lands)
+    // races the unconditional call at the end of this method and can lose,
+    // leaving the manifest referencing fewer tables than actually exist on
+    // disk (or none at all if every in-loop persist is still pending).
+    const pending = [];
     for (const [soul, node] of graph.nodes) {
       let maxTs = 0;
       for (const v of Object.values(node.state)) if (v > maxTs) maxTs = v;
-      this.add(soul, { data: node.data, state: node.state, timestamp: maxTs });
+      const shouldFlush = this.write(soul, { data: node.data, state: node.state, timestamp: maxTs });
+      if (shouldFlush) {
+        const flushed = this.flushMemtable();
+        if (flushed?._persistPromise) pending.push(flushed._persistPromise);
+        if (this.sstables.length >= this.SSTABLE_MERGE_THRESHOLD) {
+          pending.push(this.compactSSTables());
+        }
+      }
     }
+    if (this.memtable.size > 0) {
+      const flushed = this.flushMemtable();
+      if (flushed?._persistPromise) pending.push(flushed._persistPromise);
+    }
+    // Await every persist/compaction the loop above triggered — including
+    // ones chained after this point in the shared _compactionPromise queue —
+    // before touching stale-file cleanup or the manifest, so _fileId is
+    // settled on every table currently in this.sstables.
+    await Promise.all(pending);
+    await Promise.all(this.sstables.map((t) => t._persistPromise).filter(Boolean));
     if (staleFileIds.length) {
       await Promise.all(staleFileIds.map((id) => this._deleteSSTableFile(id))).catch((err) => {
         if (typeof console !== 'undefined' && console.error) {
@@ -207,10 +234,10 @@ class BTreeIndex {
       });
     }
     // Rewrite the manifest unconditionally so it reflects the actual current
-    // this.sstables set once stale files are gone — add()-triggered flushes
-    // during the loop above may or may not have crossed the flush threshold,
-    // so this.sstableDir's manifest.json can otherwise keep referencing
-    // deleted fileIds indefinitely until an unrelated later flush overwrites it.
+    // this.sstables set once stale files are gone and every in-loop persist
+    // has settled (awaited above) — otherwise this.sstableDir's manifest.json
+    // can keep referencing deleted fileIds, or omit just-written ones,
+    // indefinitely until an unrelated later flush overwrites it.
     if (this.SSTABLE_DISK_ENABLED) await this._writeManifest();
   }
 
@@ -226,9 +253,9 @@ class BTreeIndex {
     this.sstables.splice(lo, 0, table);
   }
 
-  /** Flush memtable to a new SSTable (in-memory Map). Persists to disk too when SSTABLE_DISK_ENABLED. */
+  /** Flush memtable to a new SSTable (in-memory Map). Persists to disk too when SSTABLE_DISK_ENABLED. Returns the new table, or undefined if the memtable was empty. */
   flushMemtable() {
-    if (this.memtable.size === 0) return;
+    if (this.memtable.size === 0) return undefined;
 
     const sorted = Array.from(this.memtable.entries())
       .sort((a, b) => a[0].localeCompare(b[0]));
@@ -256,6 +283,7 @@ class BTreeIndex {
         })
         .finally(() => { table._persistPromise = null; });
     }
+    return table;
   }
 
   /**
@@ -452,24 +480,54 @@ class BTreeIndex {
     if (this.SSTABLE_DISK_ENABLED) {
       const oldFileIds = [old1._fileId, old2._fileId].filter((id) => id !== undefined);
       const fileId = this._nextSstableFileId++;
-      this._persistSSTable(mergedTable, fileId)
+      // Assigned the same way flushMemtable() assigns it on a freshly flushed
+      // table, so any later wait-guard (rebuild(), a subsequent compaction
+      // picking this table as old1/old2) can detect and await this table's
+      // still-in-flight disk write instead of reading undefined as "nothing
+      // pending" and racing past it.
+      mergedTable._persistPromise = this._persistSSTable(mergedTable, fileId)
         .then(() => Promise.all(oldFileIds.map((id) => this._deleteSSTableFile(id))))
         .catch((err) => {
           if (typeof console !== 'undefined' && console.error) {
             console.error('BTreeIndex: failed to persist compacted SSTable to disk', err?.message || err);
           }
-        });
+        })
+        .finally(() => { mergedTable._persistPromise = null; });
     }
   }
 
-  /** All entries (memtable + all SSTables, deduplicated). */
+  /** All entries (memtable + all SSTables, deduplicated by newest timestamp — mirrors get()/_collectPairs). */
   getAllEntries() {
     const all = new Map();
+    const keep = (soul, entry) => {
+      const existing = all.get(soul);
+      if (!existing || (entry.timestamp || 0) >= (existing.timestamp || 0)) all.set(soul, entry);
+    };
     for (const t of this.sstables) {
-      for (const [soul, entry] of t.index) all.set(soul, entry);
+      for (const [soul, entry] of t.index) keep(soul, entry);
     }
-    for (const [soul, entry] of this.memtable) all.set(soul, entry);
+    for (const [soul, entry] of this.memtable) keep(soul, entry);
     return Array.from(all.values());
+  }
+
+  /**
+   * Await every currently in-flight disk-backed persistence operation this
+   * index has outstanding: per-table `_persistPromise`s (from flushMemtable
+   * and compactSSTables), the manifest write queue, and any in-flight
+   * compaction. Called from `Storage.close()` so a caller following the
+   * documented graceful-shutdown pattern (`close()` then process exit)
+   * doesn't leave an orphaned partial `sstable-N.json` with no manifest
+   * entry, or a manifest write that never lands. A no-op when
+   * SSTABLE_DISK_ENABLED is off (nothing was ever queued to disk). Never
+   * rejects: each underlying promise already swallows its own I/O error via
+   * its own .catch (see flushMemtable/_compactSSTablesOnce), so there is
+   * nothing further to propagate here.
+   */
+  async waitForPendingDiskWrites() {
+    if (!this.SSTABLE_DISK_ENABLED) return;
+    await (this._compactionPromise || Promise.resolve()).catch(() => {});
+    await Promise.all(this.sstables.map((t) => t._persistPromise).filter(Boolean)).catch(() => {});
+    await (this._manifestWriteQueue || Promise.resolve()).catch(() => {});
   }
 
   /** Get stats for debugging. */

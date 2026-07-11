@@ -97,8 +97,15 @@ class Network {
     this.REP_GOSSIP_DELTA_MIN = opts.repGossipDeltaMin ?? -5;
     this.REP_GOSSIP_DELTA_MAX = opts.repGossipDeltaMax ?? 10;
     this.REP_GOSSIP_MAX_TARGETS = opts.repGossipMaxTargets || 20; // distinct peerIds one connection may gossip about per window
+    // Bounds REPEATED entries for the SAME peerId within one window — the
+    // distinct-target limiter above only gates the first entry per peerId,
+    // so a message with many entries for one victim peerId (each carrying a
+    // distinct fake timestamp to defeat the entryKey dedup) could otherwise
+    // drive that single peer arbitrarily negative, bounded only by the much
+    // looser maxReputationLedger message-length cap.
+    this.REP_GOSSIP_MAX_ENTRIES_PER_TARGET = opts.repGossipMaxEntriesPerTarget || 5;
     this.REP_GOSSIP_WINDOW_MS = opts.repGossipWindowMs || 60000;
-    this._gossipTargetsByConn = new Map(); // connKey -> { targets: Set<peerId>, windowStart: ms }
+    this._gossipTargetsByConn = new Map(); // connKey -> { targets: Set<peerId>, entryCounts: Map<peerId, number>, windowStart: ms }
 
     // DHT tuning parameters
     this.DHT_K = opts.dhtK || 3; // K-nearest peers per bucket
@@ -207,6 +214,15 @@ class Network {
     const { WebSocketServer } = require('ws');
     this.wss = new WebSocketServer({ server: this.opts.server, path: '/nevil', maxPayload: this.MAX_PAYLOAD_BYTES });
     this.wss.on('connection', (ws) => this._attach(ws));
+    // A WebSocketServer is a Node EventEmitter: an 'error' event with zero
+    // listeners throws as an uncaught exception and crashes the whole
+    // process (malformed upgrade handshake, underlying HTTP server protocol
+    // error, etc.) — an unauthenticated remote DoS without this handler.
+    this.wss.on('error', (e) => {
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('nevil network: WebSocketServer error', e?.message || e);
+      }
+    });
   }
 
   _dial(url, attempt = 0) {
@@ -230,9 +246,26 @@ class Network {
     this.metrics.peersConnected = this.sockets.size;
     // Register the peer in the health map immediately so DHT routing sees
     // real connected peers by default (no external caller required).
-    const peerKey = this._getPeerKey(ws);
+    let peerKey = this._getPeerKey(ws);
     this.updatePeerHealth(peerKey, 0, 0);
-    const handleOpen = () => { ws._dialAttempt = 0; this.updatePeerHealth(this._getPeerKey(ws), 0, 0); };
+    const handleOpen = () => {
+      ws._dialAttempt = 0;
+      // For a dialed (not server-accepted) socket, _getPeerKey returns the
+      // dial URL before the TCP handshake completes and address:port after —
+      // re-keying here without migrating the pre-connect entry would leave
+      // two permanent, never-reconciled peerHealthScores entries for one
+      // physical peer (the stale URL-keyed stub is never read again but also
+      // never cleaned up, since handleClose only ever deletes the CURRENT key).
+      const newKey = this._getPeerKey(ws);
+      if (newKey !== peerKey) {
+        this.peerHealthScores.delete(peerKey);
+        this.peerRoutingKeys.delete(peerKey);
+        if (this.peerClocks) this.peerClocks.delete(peerKey);
+        this._gossipTargetsByConn.delete(peerKey);
+        peerKey = newKey;
+      }
+      this.updatePeerHealth(peerKey, 0, 0);
+    };
     const handleClose = () => {
       this.sockets.delete(ws);
       this.metrics.peersConnected = this.sockets.size;
@@ -428,7 +461,7 @@ class Network {
         let targetInfo = this._gossipTargetsByConn.get(connKey);
         const now = Date.now();
         if (!targetInfo || now - targetInfo.windowStart > this.REP_GOSSIP_WINDOW_MS) {
-          targetInfo = { targets: new Set(), windowStart: now };
+          targetInfo = { targets: new Set(), entryCounts: new Map(), windowStart: now };
           this._gossipTargetsByConn.set(connKey, targetInfo);
           if (this._gossipTargetsByConn.size > this.maxSeen) {
             this._gossipTargetsByConn.delete(this._gossipTargetsByConn.keys().next().value);
@@ -438,13 +471,23 @@ class Network {
           // Number.isFinite (not just typeof === 'number') excludes
           // NaN/Infinity/-Infinity, and the magnitude clamp bounds a single
           // entry's effect — without both, one unauthenticated frame could
-          // permanently poison a peerId's reputation to -Infinity (matching
-          // nevil.js's mergeReputationLedger, which already clamps the same way).
+          // permanently poison a peerId's reputation to -Infinity. nevil.js's
+          // mergeReputationLedger shares this same REP_GOSSIP_DELTA_MIN/MAX
+          // clamp, dedup set, and per-caller target rate-limit.
           if (!entry || typeof entry.peerId !== 'string' || typeof entry.delta !== 'number' || !Number.isFinite(entry.delta)) continue;
           if (!targetInfo.targets.has(entry.peerId)) {
             if (targetInfo.targets.size >= this.REP_GOSSIP_MAX_TARGETS) continue; // this connection already exhausted its per-window target budget
             targetInfo.targets.add(entry.peerId);
           }
+          // The distinct-target check above only gates the FIRST entry seen
+          // for a peerId this window — without a separate per-peerId count,
+          // a single oversized message with many entries for one victim
+          // peerId (each carrying a distinct fake timestamp to defeat the
+          // entryKey dedup below) could apply an unbounded number of clamped
+          // deltas to that one target, bounded only by the much looser
+          // maxReputationLedger message-length cap.
+          const appliedCount = targetInfo.entryCounts.get(entry.peerId) || 0;
+          if (appliedCount >= this.REP_GOSSIP_MAX_ENTRIES_PER_TARGET) continue; // this connection already exhausted its per-window per-target entry budget
           // Gossip entries are unauthenticated hearsay (no proof the
           // reporting connection actually observed entry.peerId's behavior),
           // so the clamp is sized to the largest single LOCAL-observation
@@ -464,6 +507,7 @@ class Network {
           if (this._seenReputationEntries.size > this.maxReputationLedger) {
             this._seenReputationEntries.delete(this._seenReputationEntries.values().next().value);
           }
+          targetInfo.entryCounts.set(entry.peerId, appliedCount + 1);
           const sum = this.reputationCache.get(entry.peerId) || 0;
           this._setReputationCache(entry.peerId, sum + delta);
         }
@@ -569,10 +613,13 @@ class Network {
     // us in a mesh where recipients don't relay to their own sender.
     const allConnectedAlreadyTargeted = routedPeers.size >= this.sockets.size;
     if (this.DHT_ENABLED && this.sockets.size > 0 && !allConnectedAlreadyTargeted) {
+      this._dhtFallbackTimers = this._dhtFallbackTimers || new Set();
       const timer = setTimeout(() => {
+        this._dhtFallbackTimers.delete(timer);
         if (!this._ackedIds?.has(msg.id)) this._relay(msg, null, true);
       }, this.DHT_FALLBACK_THRESHOLD);
       if (timer.unref) timer.unref();
+      this._dhtFallbackTimers.add(timer);
     }
     return msg;
   }
@@ -1106,6 +1153,7 @@ class Network {
     if (this._queueDrainTimer) { clearTimeout(this._queueDrainTimer); this._queueDrainTimer = null; }
     if (this._powAdjustTimer) { clearInterval(this._powAdjustTimer); this._powAdjustTimer = null; }
     if (this._redialTimers) { for (const timer of this._redialTimers) clearTimeout(timer); this._redialTimers.clear(); }
+    if (this._dhtFallbackTimers) { for (const timer of this._dhtFallbackTimers) clearTimeout(timer); this._dhtFallbackTimers.clear(); }
     for (const ws of this.sockets) {
       ws._redialScheduled = true; // suppress self-heal redial on close
       try { ws.terminate ? ws.terminate() : ws.close(); } catch { /* already closed */ }

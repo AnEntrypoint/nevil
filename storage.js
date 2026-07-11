@@ -89,13 +89,38 @@ class NodeLogStore {
   async compact(entries) {
     const lines = entries.map((e) => JSON.stringify(e)).join('\n') + (entries.length ? '\n' : '');
     // Route through the same _writeQueue as appendEntries() — otherwise a
-    // concurrent in-flight append and this unqueued writeFile race at the OS
+    // concurrent in-flight append and this unqueued write race at the OS
     // level, losing the append entirely or corrupting the log's trailing bytes.
-    const queue = (this._writeQueue || Promise.resolve()).then(() => this.fs.promises.writeFile(this.filePath, lines, 'utf8'));
+    const queue = (this._writeQueue || Promise.resolve()).then(async () => {
+      // Write to a sibling temp file, then rename over the real path — a
+      // direct writeFile(filePath, 'w') truncates to zero bytes BEFORE writing
+      // new content, so a crash mid-write loses the entire prior log body, not
+      // just a torn tail (unlike appendEntries, which only ever adds bytes to
+      // an intact file). rename() is atomic on both POSIX and Windows: readers
+      // always see either the old complete file or the new complete file.
+      const tmpPath = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
+      if (this.fsyncOnWrite) {
+        const fh = await this.fs.promises.open(tmpPath, 'w');
+        try {
+          await fh.writeFile(lines, 'utf8');
+          await fh.sync();
+        } finally {
+          await fh.close();
+        }
+      } else {
+        await this.fs.promises.writeFile(tmpPath, lines, 'utf8');
+      }
+      await this.fs.promises.rename(tmpPath, this.filePath);
+    });
     // Same poisoning-recovery reset as appendEntries(): a failed compact must
     // not permanently disable every future append/compact on this store.
     this._writeQueue = queue.catch(() => {});
     await queue;
+  }
+
+  /** Await the current tail of the write queue — lets a caller (Storage.close()) wait for an in-flight/queued appendEntries or compact to actually reach disk before tearing down, instead of racing process exit against a fire-and-forget persist(). Never rejects: a failed write already resolves its own awaiter via the un-reset queue reference in appendEntries/compact, so drain() only needs to know the queue is IDLE, not whether the last write succeeded. */
+  async drain() {
+    await (this._writeQueue || Promise.resolve()).catch(() => {});
   }
 
   /** No file handle is held open between writes (each appendFile/writeFile call opens and closes its own), so there is nothing to release — present for interface parity with BrowserLogStore.close(). */
@@ -163,6 +188,11 @@ class BrowserLogStore {
     return queue;
   }
 
+  /** Await the current tail of the write queue — same contract as NodeLogStore.drain(): lets a caller wait for an in-flight/queued write to actually reach IndexedDB before tearing down. Never rejects. */
+  async drain() {
+    await (this._writeQueue || Promise.resolve()).catch(() => {});
+  }
+
   /** Release the open IndexedDB connection — without this, a discarded Storage/Nevil instance leaks a connection for the page's lifetime, which can block a later indexedDB.deleteDatabase() or a version-upgrade open from another tab. */
   close() {
     this._ready.then((db) => db.close()).catch(() => {});
@@ -188,8 +218,30 @@ class Storage {
     this.index = opts.enableIndex ? new BTreeIndex(opts) : null;
   }
 
-  /** Release the three log stores' underlying resources (IndexedDB connections in-browser; a no-op in Node, which holds no file handle open between writes). */
-  close() {
+  /**
+   * Drain every in-flight/queued write (main log, reputation log, peer-table
+   * log, and — when soul indexing is on — the BTreeIndex's own pending
+   * disk-backed SSTable/manifest writes) before releasing the log stores'
+   * underlying resources (IndexedDB connections in-browser; a no-op in
+   * Node, which holds no file handle open between writes). Without this, a
+   * write that already updated in-memory graph state (nevil.js's
+   * graph.onAny handler calls storage.persist() unawaited, by design, since
+   * that handler is synchronous) can still be sitting in a log store's
+   * `_writeQueue` when close() returns — a caller following the documented
+   * close()-then-exit shutdown pattern would then lose that write entirely,
+   * even though it looked durable from every observable in-process signal
+   * (graph.get() already reflected it). Now async: callers doing a graceful
+   * shutdown should `await` it; existing fire-and-forget callers (a crash
+   * handler, a synchronous teardown path) are unaffected since a dropped
+   * returned promise behaves exactly like the prior fire-and-forget close().
+   */
+  async close() {
+    await Promise.all([
+      this.log.drain(),
+      this.reputationLog.drain(),
+      this.peerTableLog.drain(),
+      this.index ? this.index.waitForPendingDiskWrites() : Promise.resolve(),
+    ]);
     this.log.close();
     this.reputationLog.close();
     this.peerTableLog.close();
@@ -281,9 +333,23 @@ class Storage {
     // load() and pollutes graph.nodes on every future boot.
     if (typeof soul !== 'string' || !soul) throw new TypeError('storage.persist: soul must be a non-empty string');
     await this.log.appendEntries([{ soul, fields, ts, lamportClock }]);
+    // The durable write above already succeeded once this line runs — an
+    // index.add() failure past this point is an in-memory index desync, not
+    // a durability failure, so it must not surface through the same
+    // rejection path/message as an appendEntries failure (which callers like
+    // nevil.js's _onPersistError log as "write remains in-memory, not yet
+    // durable" — false for this case, since the log entry is already on
+    // disk). Tag the error so a caller can tell the two apart.
     if (this.index) {
-      const maxTs = ts ? maxOf(Object.values(ts)) : Date.now();
-      this.index.add(soul, { data: fields, state: ts, timestamp: maxTs });
+      try {
+        const maxTs = ts ? maxOf(Object.values(ts)) : Date.now();
+        this.index.add(soul, { data: fields, state: ts, timestamp: maxTs });
+      } catch (err) {
+        const indexErr = err instanceof Error ? err : new Error(String(err));
+        indexErr.durable = true;
+        indexErr.indexOnly = true;
+        throw indexErr;
+      }
     }
   }
 
@@ -356,11 +422,22 @@ class Storage {
     // thrown compact() must never durably diverge in-memory state from what
     // was actually committed.
     await this.log.compact(entries);
-    // Purged souls are deleted from graph.nodes here; the unconditional
-    // index.rebuild(graph) below (not an incremental per-soul removal — no
-    // such method exists on BTreeIndex) is what actually drops them from
-    // the index, since it rebuilds from the already-purged graph.nodes.
-    for (const soul of purgedSouls) graph.nodes.delete(soul);
+    // Re-check each purge candidate against the LIVE graph, not the
+    // pre-await snapshot: a concurrent write (e.g. a remote revival applied
+    // via nevil._applyRemote -> graph.mergeNode -> storage.persist) can land
+    // on graph.nodes and its own log entry while log.compact()'s I/O is in
+    // flight above. Deleting unconditionally from the stale purgedSouls list
+    // would drop that revived, now-live soul from the graph even though the
+    // log (and index) still correctly hold its revived data — a durable,
+    // non-self-healing divergence. A soul is only deleted here if it is
+    // STILL fully tombstoned at this point in time.
+    for (const soul of purgedSouls) {
+      const node = graph.nodes.get(soul);
+      if (!node) continue;
+      const stillTombstoned = Object.keys(node.data).length > 0
+        && Object.values(node.data).every((v) => v === null || v === undefined);
+      if (stillTombstoned) graph.nodes.delete(soul);
+    }
     if (this.index) {
       await this.index.rebuild(graph);
       this.index.flushMemtable();

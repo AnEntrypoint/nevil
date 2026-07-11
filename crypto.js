@@ -20,6 +20,12 @@ const subtle = globalThis.crypto.subtle;
 // of previously-sealed payloads (see PBKDF2_ITERATIONS fallback below).
 const PBKDF2_ITERATIONS = 100000;
 
+// Upper bound on a payload-declared iteration count. payload.iterations is
+// untrusted (sealedSeed graph data can arrive via network merge or disk
+// tampering, not just from this module's own encryptWithPass), so it is
+// clamped before reaching subtle.deriveKey to prevent CPU-exhaustion DoS.
+const PBKDF2_ITERATIONS_MAX = 1000000;
+
 // btoa/atob exist in browsers; polyfill minimally for Node. Declared before
 // toB64/fromB64 (which close over them) so there is no temporal-dead-zone
 // hazard if either is ever called during module load, not just after.
@@ -88,6 +94,9 @@ async function decryptWithPass(payload, passphrase) {
   // Legacy payloads (sealed before this field existed) always used 100000 —
   // PBKDF2_ITERATIONS' current value — so the fallback keeps them decryptable.
   const iterations = typeof payload.iterations === 'number' ? payload.iterations : PBKDF2_ITERATIONS;
+  if (!Number.isFinite(iterations) || iterations < 1 || iterations > PBKDF2_ITERATIONS_MAX) {
+    throw new Error('corrupt or malformed sealed payload: iterations out of range');
+  }
   const baseKey = await subtle.importKey('raw', new TextEncoder().encode(passphrase.normalize('NFC')), 'PBKDF2', false, ['deriveKey']);
   const key = await subtle.deriveKey(
     { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },

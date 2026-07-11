@@ -186,16 +186,16 @@ function resolveOne(graph, soul, q, depth, maxDepth) {
         .map((r) => resolveOne(graph, r['#'], sub, depth + 1, maxDepth))
         .filter((v) => v !== null);
 
-      if (sub.sort) {
+      if (sub.sort && !isAliasShaped(sub.sort)) {
         const [sortKey, sortOrder] = Array.isArray(sub.sort) ? sub.sort : [sub.sort, 'asc'];
         resolved.sort((a, b) => compareSortKeys(a[sortKey], b[sortKey], sortOrder));
       }
 
-      if (sub.offset != null) {
+      if (sub.offset != null && !isAliasShaped(sub.offset)) {
         if (sub.offset < 0) throw new Error('query offset must not be negative');
         resolved = resolved.slice(sub.offset);
       }
-      if (sub.limit != null) {
+      if (sub.limit != null && !isAliasShaped(sub.limit)) {
         if (sub.limit < 0) throw new Error('query limit must not be negative');
         resolved = resolved.slice(0, sub.limit);
       }
@@ -237,16 +237,16 @@ function query(graph, q) {
     });
     results = dedupedSouls.map((soul) => resolveOne(graph, soul, q, 0)).filter((r) => r !== null);
 
-    if (q.sort) {
+    if (q.sort && !isAliasShaped(q.sort)) {
       const [sortKey, sortOrder] = Array.isArray(q.sort) ? q.sort : [q.sort, 'asc'];
       results.sort((a, b) => compareSortKeys(a[sortKey], b[sortKey], sortOrder));
     }
 
-    if (q.offset != null) {
+    if (q.offset != null && !isAliasShaped(q.offset)) {
       if (q.offset < 0) throw new Error('query offset must not be negative');
       results = results.slice(q.offset);
     }
-    if (q.limit != null) {
+    if (q.limit != null && !isAliasShaped(q.limit)) {
       if (q.limit < 0) throw new Error('query limit must not be negative');
       results = results.slice(0, q.limit);
     }

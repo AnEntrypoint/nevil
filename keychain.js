@@ -108,9 +108,6 @@ function checkSodiumHealth() {
 }
 checkSodiumHealth();
 
-// Numbers get a leading 0x00 type-tag byte so a numeric label (e.g. sub(42))
-// can never collide with its string form (sub('42')) -- both would otherwise
-// reduce to the identical UTF-8 bytes and derive the same child address.
 function toBuf(x) {
   if (Buffer.isBuffer(x)) return x;
   if (x instanceof Uint8Array) return Buffer.from(x.buffer, x.byteOffset, x.byteLength);
@@ -118,6 +115,30 @@ function toBuf(x) {
   if (typeof x === 'number') return Buffer.concat([Buffer.from([0]), Buffer.from(String(x), 'utf8')]);
   throw new TypeError('expected Buffer, Uint8Array, string, or number');
 }
+
+// Every label TYPE gets its own leading type-tag byte before hashing, so no
+// two label types/values can ever collide on the same tweak seed --
+// including a string whose literal first byte happens to equal the number
+// branch's 0x00 tag (e.g. '\x0042'), which toBuf() alone does not
+// distinguish from sub(42) (both reduce to the same UTF-8 bytes). Tagging
+// here (once, at the point labels actually get hashed) rather than inside
+// toBuf() keeps toBuf()'s other callers -- raw message/signature/public-key
+// byte coercion, which must NOT be tagged -- unaffected. Also accepts
+// boolean/null labels (falsy values sub() must treat as real, distinct
+// labels), which toBuf() itself does not handle.
+function toLabelBuf(x) {
+  if (typeof x === 'string') return Buffer.concat([Buffer.from([1]), Buffer.from(x, 'utf8')]);
+  if (Buffer.isBuffer(x) || x instanceof Uint8Array) return Buffer.concat([Buffer.from([2]), toBuf(x)]);
+  if (typeof x === 'boolean') return Buffer.from([3, x ? 1 : 0]);
+  if (x === null) return Buffer.from([4]);
+  return toBuf(x); // numbers already self-tag with 0x00 inside toBuf()
+}
+
+// Distinguishes "no tweak yet" from a legitimate falsy label (0, '', false,
+// null all pass through sub() as real labels) -- `tweak === null` cannot
+// serve as the unset sentinel because sub(null) must itself derive a real,
+// distinct child. No caller can pass this symbol as a label (module-private).
+const UNSET_TWEAK = Symbol('unset-tweak');
 
 /** A single derived keypair: a public key, and (if writable) the tweaked private scalar. */
 class KeyPair {
@@ -228,7 +249,7 @@ function encryptFor(boxPublicKey, message) {
 
 /** tweak = blake2b(parentPublicKey || label) -> (tweakScalar, tweakPublicKey), exactly as keypear computes it. */
 function deriveTweak(parentPublicKey, label) {
-  const labelBuf = toBuf(label);
+  const labelBuf = toLabelBuf(label);
   const seed = Buffer.alloc(32);
   sodium.crypto_generichash_batch(seed, [parentPublicKey, labelBuf]);
 
@@ -296,7 +317,7 @@ class Keychain {
       throw new TypeError('unsupported Keychain constructor argument');
     }
     this.base = this.home;
-    this.tweak = null;
+    this.tweak = UNSET_TWEAK;
   }
 
   static fromPublicKey(publicKeyHexOrBytes) {
@@ -322,7 +343,11 @@ class Keychain {
 
   /** Get a KeyPair from this chain's head, optionally tweaked by a label first. */
   get(label) {
-    const head = this.tweak ? this.base.derive(this.tweak) : this.base;
+    // sub() can legitimately store a falsy label (0, '', false, null), so a
+    // truthy check here would skip derive() entirely and silently return
+    // the parent's own key material instead of the intended child's --
+    // UNSET_TWEAK is the only value that means "no tweak".
+    const head = this.tweak !== UNSET_TWEAK ? this.base.derive(this.tweak) : this.base;
     return label === undefined ? head : head.derive(label);
   }
 
@@ -356,7 +381,7 @@ class Keychain {
     const c = Object.create(Keychain.prototype);
     c.home = this.home;
     c.base = target;
-    c.tweak = null;
+    c.tweak = UNSET_TWEAK;
     return c;
   }
 

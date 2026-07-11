@@ -95,6 +95,20 @@ class Nevil {
     this._ready.catch(() => {});
     this._identity = null; // { keychain, soul } once logged in / created
     this._lamportClock = 0; // global lamport clock for cross-batch ACID
+    // Every fire-and-forget storage.persist() call (graph.onAny/_applyRemote
+    // below) is tracked here so close() can await the full set instead of
+    // only the log store's own write queue — a persist() call still
+    // mid-flight (not yet reached appendEntries) at the moment close() is
+    // invoked would otherwise be invisible to a queue-based drain alone.
+    this._pendingPersists = new Set();
+  }
+
+  /** Track a fire-and-forget storage.persist() call so close() can await it; self-removes on settle regardless of outcome. */
+  _trackPersist(promise) {
+    this._pendingPersists.add(promise);
+    const untrack = () => this._pendingPersists.delete(promise);
+    promise.then(untrack, untrack);
+    return promise;
   }
 
   async _boot() {
@@ -138,7 +152,7 @@ class Nevil {
       // turns that rejection into an unhandled promise rejection that crashes
       // the whole process. Matches the graceful-degradation pattern already
       // used for storage.persist(...) at the graph.onAny/_applyRemote sites below.
-      onReputationDelta: (entry) => this.storage.persistReputationEntry(entry).catch((err) => this._onPersistError(err, entry.peerId)),
+      onReputationDelta: (entry) => this._trackPersist(this.storage.persistReputationEntry(entry).catch((err) => this._onPersistError(err, entry.peerId))),
     }, (msg) => {
       if (msg.type === 'put') this._applyRemote(msg);
     });
@@ -181,8 +195,10 @@ class Nevil {
       // awaited (this handler is sync, called from graph.onAny), but its
       // rejection is caught explicitly — an uncaught rejection here (e.g.
       // disk full, permission error) would otherwise crash the process on
-      // an otherwise-recoverable I/O error.
-      this.storage.persist(soul, fields, ts, lamport).catch((err) => this._onPersistError(err, soul));
+      // an otherwise-recoverable I/O error. Tracked via _trackPersist so
+      // close() can wait for this specific call even if it hasn't reached
+      // storage.log's write queue yet at the moment close() is invoked.
+      this._trackPersist(this.storage.persist(soul, fields, ts, lamport).catch((err) => this._onPersistError(err, soul)));
       // Gossip only reputation deltas accrued since the last gossip, not the
       // entire ledger every message — attaching up to maxReputationLedger
       // (20000) entries on every single put both bloats bandwidth per-message
@@ -235,25 +251,42 @@ class Nevil {
   }
 
   /**
-   * Tear down the network layer, close the storage backend (releasing its
-   * IndexedDB connections in-browser / file handles in Node), and unsubscribe
-   * graph listeners so this instance can be cleanly discarded. `this.network`
-   * is only assigned inside the async `_boot()` kicked off (not awaited) by
+   * Tear down the network layer, close the storage backend (draining every
+   * in-flight/queued disk write first, then releasing its IndexedDB
+   * connections in-browser / file handles in Node), and unsubscribe graph
+   * listeners so this instance can be cleanly discarded. `this.network` is
+   * only assigned inside the async `_boot()` kicked off (not awaited) by
    * the constructor, so a caller that closes before `ready()` resolves (a
    * failed-fast request handler, a test harness tearing down after a
    * construction error) would otherwise crash on `this.network` being
    * undefined. `this.storage` is assigned synchronously in the constructor,
    * so it is always present by the time close() can be called.
+   *
+   * Returns a Promise a caller doing a graceful shutdown should await
+   * before exiting the process — this.graph.onAny's handler calls
+   * storage.persist() unawaited (it's a synchronous listener), so a write
+   * can still be sitting in a log store's write queue when close() is
+   * called; awaiting the returned promise is the only way to guarantee that
+   * write actually reaches disk before the process exits. A caller that
+   * drops the returned promise (fire-and-forget close(), matching the prior
+   * synchronous behavior) is unaffected other than losing this guarantee.
    */
-  close() {
+  async close() {
     // Set first: a _boot() suspended on an in-flight await checks this flag
     // immediately after resuming and aborts instead of finishing construction
     // of a network/timer/listener that this call already intended to tear down.
     this._closed = true;
     if (this._peerTableSaveTimer) { clearInterval(this._peerTableSaveTimer); this._peerTableSaveTimer = null; }
     if (this.network) this.network.close();
-    if (this.storage) this.storage.close();
     if (this._unsubAny) this._unsubAny();
+    // Wait for every tracked fire-and-forget persist() call to at least
+    // settle (each one's own .catch already routes failures to
+    // _onPersistError, so this never rejects) before draining storage's log
+    // stores — a persist() call still mid-flight (not yet enqueued onto the
+    // log store's own write queue) would otherwise be invisible to
+    // storage.close()'s queue-based drain alone.
+    if (this._pendingPersists.size) await Promise.all(this._pendingPersists);
+    if (this.storage) await this.storage.close();
   }
 
   _applyRemote(msg) {
@@ -311,21 +344,30 @@ class Nevil {
         ts[f] = msg.ts[f];
         lamport[f] = msg.lamportClock;
       }
-      this.storage.persist(msg.soul, fields, ts, lamport).catch((err) => this._onPersistError(err, msg.soul));
+      this._trackPersist(this.storage.persist(msg.soul, fields, ts, lamport).catch((err) => this._onPersistError(err, msg.soul)));
     }
   }
 
   /**
    * Default persist-failure handler: log and keep running rather than let
-   * an unhandled promise rejection crash the process. The write already
-   * landed in-memory (graph state is correct); only the durable log write
-   * failed, so this is a durability-degradation event, not data loss of
-   * the current in-memory state. Callers wanting custom handling (retry,
+   * an unhandled promise rejection crash the process. Two distinct failure
+   * modes reach here, distinguished by `err.indexOnly` (set by
+   * storage.persist when the durable log append already succeeded and only
+   * the in-memory BTreeIndex update failed afterward): the durability-
+   * degradation case (log append itself failed — write is in-memory only,
+   * not yet durable) and the index-desync case (write IS durable on disk;
+   * only the queryable index is out of sync with it). Reporting both as
+   * "not yet durable" would mislabel the second and mask troubleshooting of
+   * a real index-corruption bug. Callers wanting custom handling (retry,
    * alerting, etc.) can override `nevil.onPersistError`.
    */
   _onPersistError(err, soul) {
     if (this.onPersistError) return this.onPersistError(err, soul);
-    console.error(`nevil: storage.persist failed for soul ${soul} (write remains in-memory, not yet durable):`, err);
+    if (err?.indexOnly) {
+      console.error(`nevil: storage index update failed for soul ${soul} (write IS durable on disk; only the in-memory index is out of sync):`, err);
+    } else {
+      console.error(`nevil: storage.persist failed for soul ${soul} (write remains in-memory, not yet durable):`, err);
+    }
   }
 
   /**
@@ -389,7 +431,7 @@ class Nevil {
    * could otherwise force a CA node's quorum gate to pass during a genuine
    * partition from its real configured peers, just by opening throwaway
    * connections. `network._dial()` stamps `ws._dialUrl` on every socket IT
-   * initiated (network.js:167); inbound/server-attached sockets never get
+   * initiated (network.js:232); inbound/server-attached sockets never get
    * that property, so filtering on it (matched against the same configured
    * peer set `_quorumPeerCount()` uses as the denominator) restricts the
    * numerator to sockets that are actually one of the peers being quorate over.
@@ -461,6 +503,14 @@ class Nevil {
 
   /** Create a relationship: node[field] = soul-reference to targetSoul. */
   link(soul, field, targetSoul) {
+    // ref() (graph.js) does no type checking and stores {'#': targetSoul}
+    // verbatim for any input — a non-string targetSoul then makes resolve()
+    // (isRef check fails, returns the raw ref object as a plain value) and
+    // query.js's via-traversal (isRef check fails, sets the field to null)
+    // silently disagree on the same malformed data instead of either one
+    // surfacing the real mistake. Validate here, matching put/putAt/delete's
+    // existing soul-argument validation.
+    if (typeof targetSoul !== 'string' || !targetSoul) throw new TypeError('link: targetSoul must be a non-empty string');
     return this.put(soul, { [field]: ref(targetSoul) });
   }
 
@@ -756,6 +806,15 @@ class Nevil {
     const subKeyPair = new KeyPair({ publicKey: subSoulBuf, scalar: null });
 
     if (!node._owner || !node._path) return undefined; // no custody claim at all — nothing to trust
+    // A remote/local `put` can write `_owner`/`_path`/any field as an
+    // arbitrary JSON shape (mergeNode validates only count/timestamp/clock,
+    // never value shape) — e.g. `{v: ..., sig: 999}` or `.sig` omitted
+    // entirely. Buffer.from(non-string, 'hex') throws synchronously and
+    // uncaught, so a malformed `.sig` must be treated as a failed
+    // verification (fail closed) before ever reaching Buffer.from, the same
+    // way KeyPair.verify() already fails closed on a bad-length signature
+    // STRING — this extends that same posture to a bad signature TYPE.
+    if (typeof node._owner.sig !== 'string' || typeof node._path.sig !== 'string') return undefined;
     const ownerOk = subKeyPair.verify(Buffer.from(JSON.stringify(node._owner.v)), Buffer.from(node._owner.sig, 'hex'));
     const pathOk = subKeyPair.verify(Buffer.from(JSON.stringify(node._path.v)), Buffer.from(node._path.sig, 'hex'));
     if (!ownerOk || !pathOk) return undefined;
@@ -784,6 +843,9 @@ class Nevil {
     for (const [k, v] of Object.entries(node)) {
       if (k === '_owner' || k === '_path') continue; // handled above
       if (v && typeof v === 'object' && v.sig) {
+        // Fail closed on a non-string sig (see the _owner/_path guard above
+        // for why) instead of letting Buffer.from throw uncaught.
+        if (typeof v.sig !== 'string') { out[k] = undefined; continue; }
         // Verify against {k, v} together, matching putAt's signing scheme —
         // a signature only ever covers the specific field name it was made
         // for, so it cannot be replayed onto a different field on the same
@@ -824,11 +886,13 @@ class Nevil {
    */
   async batchWrite(fields, options = {}) {
     if (!this._identity) throw new Error('no active identity — call createIdentityFromSeed or unlock first');
-    // Sort keys before stringifying: JSON.stringify is key-order-sensitive,
-    // so two semantically-identical fields objects with keys inserted in a
-    // different order would otherwise hash to different nonces, defeating
-    // the "identical calls land at the same sub-address" determinism goal.
-    const canonicalFields = JSON.stringify(fields, Object.keys(fields).sort());
+    // canonicalJSON (not JSON.stringify(fields, Object.keys(fields).sort()))
+    // — the array-form replacer is a top-level-only key allowlist: it does
+    // NOT recurse, so any nested object value collapses to '{}' regardless
+    // of its actual content, colliding two calls with different nested
+    // fields onto the same sub-address soul. canonicalJSON sorts keys at
+    // every nesting level, giving real deep determinism instead.
+    const canonicalFields = canonicalJSON(fields);
     const nonce = options.nonce !== undefined
       ? options.nonce
       : Buffer.from(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalFields))).toString('hex').slice(0, 16);
@@ -897,7 +961,7 @@ class Nevil {
 
   /** Merge remote reputation entries into the network ledger (for gossip). */
   mergeReputationLedger(entries) {
-    this._requireNetwork('mergeReputationLedger');
+    const network = this._requireNetwork('mergeReputationLedger');
     if (!Array.isArray(entries)) return;
     // Clamp ceiling is fixed once per call (relative to the clock's value
     // BEFORE this batch), not re-derived from _lamportClock on every
@@ -905,7 +969,24 @@ class Nevil {
     // previous entry's already-clamped result, letting an N-entry batch
     // advance the clock by ~N * CLOCK_MAX_JUMP in a single call instead of
     // being bounded by CLOCK_MAX_JUMP overall, same as any other message.
-    const ceiling = this._lamportClock + this.network.CLOCK_MAX_JUMP;
+    const ceiling = this._lamportClock + network.CLOCK_MAX_JUMP;
+    // Entries reaching this public API carry the same unauthenticated-hearsay
+    // trust profile as network.js's inline reputationLedger gossip handling
+    // (handleMessage) — no proof binds a claimed entry.peerId to whatever fed
+    // this call. Share that path's clamp bound, per-window per-caller target
+    // rate-limit, and dedup set instead of the old flat +/-100 with neither
+    // limit, which let one call blacklist an arbitrary honest peer in a
+    // single hit. There is no wire connKey here (this is a direct method
+    // call, not a parsed message), so a fixed synthetic key scopes the
+    // rate-limit bucket to "this API, called on this instance" the same way
+    // a real connKey scopes it to "this socket".
+    network._seenReputationEntries = network._seenReputationEntries || new Set();
+    let targetInfo = network._gossipTargetsByConn.get('mergeReputationLedger');
+    const now = Date.now();
+    if (!targetInfo || now - targetInfo.windowStart > network.REP_GOSSIP_WINDOW_MS) {
+      targetInfo = { targets: new Set(), entryCounts: new Map(), windowStart: now };
+      network._gossipTargetsByConn.set('mergeReputationLedger', targetInfo);
+    }
     for (const entry of entries) {
       // Validate shape before applying: an unvalidated caller-supplied
       // peerId/delta previously let a single call blacklist an arbitrary
@@ -913,8 +994,25 @@ class Nevil {
       // clock without limit (same poisoning class CLOCK_MAX_JUMP guards
       // against elsewhere — apply the same clamp here).
       if (!entry || typeof entry.peerId !== 'string' || typeof entry.delta !== 'number' || !Number.isFinite(entry.delta)) continue;
-      const delta = Math.max(-100, Math.min(100, entry.delta));
-      this.network.updateReputation(entry.peerId, delta, entry.reason);
+      if (!targetInfo.targets.has(entry.peerId)) {
+        if (targetInfo.targets.size >= network.REP_GOSSIP_MAX_TARGETS) continue; // per-window target budget exhausted
+        targetInfo.targets.add(entry.peerId);
+      }
+      // Distinct-target gate above only guards the FIRST entry per peerId —
+      // without this, one call with many entries for the same peerId (each
+      // a distinct fake timestamp defeating the entryKey dedup below) could
+      // still drive that one target arbitrarily negative in a single call.
+      const appliedCount = targetInfo.entryCounts.get(entry.peerId) || 0;
+      if (appliedCount >= network.REP_GOSSIP_MAX_ENTRIES_PER_TARGET) continue; // per-window per-target entry budget exhausted
+      const delta = Math.max(network.REP_GOSSIP_DELTA_MIN, Math.min(network.REP_GOSSIP_DELTA_MAX, entry.delta));
+      const entryKey = entry.peerId + '|' + delta + '|' + entry.reason + '|' + entry.timestamp;
+      if (network._seenReputationEntries.has(entryKey)) continue;
+      network._seenReputationEntries.add(entryKey);
+      if (network._seenReputationEntries.size > network.maxReputationLedger) {
+        network._seenReputationEntries.delete(network._seenReputationEntries.values().next().value);
+      }
+      targetInfo.entryCounts.set(entry.peerId, appliedCount + 1);
+      network.updateReputation(entry.peerId, delta, entry.reason);
       if (typeof entry.lamportClock === 'number' && Number.isFinite(entry.lamportClock)) {
         const clamped = Math.min(entry.lamportClock, ceiling);
         if (clamped > this._lamportClock) this._lamportClock = clamped;
