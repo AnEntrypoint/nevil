@@ -1,12 +1,5 @@
 # nevil
 
-A monolithic, from-scratch replacement for the GUN ecosystem — not a
-wrapper around the `gun` npm package. One codebase covering the same
-ground as GUN core + SEA + RAD + DAM/AXE, **plus** a hierarchical
-deterministic keychain (Mathias Buus's [keypear](https://github.com/holepunchto/keypear)
-scheme) used as the primary identity and addressing system, and a
-GraphQL/SQL-shaped query layer on top.
-
 Familiar to **SQLite and GraphQL users**: the API uses standard CRUD
 operations (`insert`, `update`, `delete`, `select`), queries support
 WHERE-like `filter`, ORDER BY via `sort`, and LIMIT/OFFSET pagination.
