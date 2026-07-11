@@ -42,7 +42,18 @@ async function encryptWithPass(data, passphrase, saltB64) {
   if (typeof passphrase !== 'string' || passphrase.length === 0) {
     throw new Error('passphrase must be a non-empty string');
   }
-  const salt = saltB64 ? fromB64(saltB64) : globalThis.crypto.getRandomValues(new Uint8Array(16));
+  if (data === undefined) {
+    throw new Error('data must not be undefined');
+  }
+  if (saltB64 !== undefined) {
+    if (typeof saltB64 !== 'string') {
+      throw new Error('saltB64 must be a base64url string');
+    }
+    if (fromB64(saltB64).byteLength < 16) {
+      throw new Error('saltB64 must decode to at least 16 bytes');
+    }
+  }
+  const salt = saltB64 !== undefined ? fromB64(saltB64) : globalThis.crypto.getRandomValues(new Uint8Array(16));
   const baseKey = await subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
   const key = await subtle.deriveKey(
     { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },

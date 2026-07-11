@@ -29,7 +29,7 @@ All design decisions hold against formal constraints (`.gm/constraints.md`). 32 
 |---|---|---|
 | Graph engine | `graph.js` | HAM last-write-wins CRDT + Lamport clocks for causal ordering |
 | Identity/addressing | `keychain.js` | Deterministic Ed25519 derivation (keypear-style) |
-| Crypto | `crypto.js` | Passphrase wrapping, Ed25519 signing, encrypt-for-recipient |
+| Crypto | `crypto.js` | Passphrase wrapping (PBKDF2 -> AES-GCM via Web Crypto); Ed25519 signing and encrypt-for-recipient live in `keychain.js` |
 | Storage | `storage.js` | Append-only log (Node fs / browser IndexedDB) |
 | Storage (B-tree) | `storage-btree.js` | Memtable + SSTable index wired into `Storage` for O(log n)-ish prefix/range lookups (boot still replays log O(n)) |
 | Networking | `network.js` | WebSocket + DHT-aware bounded-subset routing + reputation ledger + throttle gating |
@@ -67,13 +67,14 @@ All design decisions hold against formal constraints (`.gm/constraints.md`). 32 
 
 ### Queries
 - `query(spec)` — GraphQL-shaped: soul, select, via, list, filter, sort, limit, offset, mapToRows
+- Contract note: `query`/`select` return `null`/`[]` for a soul/selection that resolves to no data (a normal "nothing found" result); `prefixScan`/`rangeScan` (see B-tree Storage below) throw when `enableSoulIndex` is off (a disabled-feature precondition, not a data-absence result) — the two are different failure classes, not an inconsistent API
 
 ### DHT Routing (Transcendence 1: bounded-subset traffic)
 - `network._selectRoutingPeers(msg)` — select K healthiest + L adjacent connected peers for a soul's geohash bucket (flood-fill fallback when fewer than K/2 match)
 - `network._computeGeohash(soul)` — deterministic geohash bucketing
 - `network.updatePeerHealth(peerId, latency, loss)` — track peer health scores
 - `network.getHealthyPeers()` — retrieve peers sorted by health
-- `network.broadcast(payload, lamportClock)` — starts a `dhtFallbackThreshold` timer; if the message id is never observed looping back through the mesh (the real receipt signal) within the threshold, it force-reflloods to every connected peer instead of staying confined to the original DHT-selected subset
+- `network.broadcast(payload, lamportClock)` — starts a `dhtFallbackThreshold` timer; if the message id is never observed looping back through the mesh (the real receipt signal) within the threshold, it force-reflloods to every connected peer instead of staying confined to the original DHT-selected subset. Skips arming the timer entirely when the initial DHT selection already targeted every connected socket (e.g. a small/fully-connected mesh) — a reflood there would be a guaranteed duplicate send, since a message can never loop back in a mesh where recipients don't relay to their own sender
 - Config: `dhtK`, `dhtL`, `dhtGeohashLength`, `dhtHealthUpdateFreq`, `dhtFallbackThreshold`, `dhtEnabled`
 
 ### Lamport Clocks (Transcendence 2: Causal consistency)
@@ -81,7 +82,7 @@ All design decisions hold against formal constraints (`.gm/constraints.md`). 32 
 - `graph.mergeNode(soul, fields, timestamps, lamportClock)` — merge with clock ordering
 - `network.broadcast(payload, lamportClock)` — include clock in messages
 - `graph.CLOCK_MAX_JUMP` — enforced in `mergeNode`: a field/batch lamport clock more than `CLOCK_MAX_JUMP` steps ahead of `localClock` is clamped rather than accepted verbatim, so one Byzantine peer can't advertise an arbitrary clock and permanently win every future HAM comparison for a field
-- Config: `clockMaxJump`, `clockFastThreshold`, `clockConsensusSpread`
+- Config: `clockMaxJump`
 
 ### Reputation Ledger (Transcendence 3: Byzantine-resistant throttling)
 - `network.updateReputation(peerId, delta, reason)` — record reputation delta
@@ -142,8 +143,10 @@ All design decisions hold against formal constraints (`.gm/constraints.md`). 32 
 - `BTreeIndex.prefixScan(prefix)` — prefix lookup
 - `BTreeIndex.flushMemtable()` — flush to SSTable
 - `BTreeIndex.compactSSTables()` — merge old SSTables
-- Config: `memtableSizeLimit`, `memtableFlushFreq`, `sstableMergeThreshold`, `bloomFilterFpr`, `sstableBlockSize`
-- **Disk-backed SSTable persistence (opt-in):** `new Nevil({ enableSoulIndex: true, sstableDiskEnabled: true, sstableDir })` persists each flushed SSTable to its own JSON file plus a manifest under `sstableDir`; `Storage.load` calls `BTreeIndex.loadFromDisk()` first — when a valid disk snapshot exists, the index is restored in O(sstable count) instead of being rebuilt entry-by-entry alongside the O(n) log replay (the graph itself always still replays from the log — the log remains the sole source of truth for correctness; only the index's own reconstruction is skipped). `compactSSTables` deletes the old tables' files and persists the merged one when disk mode is on
+- `BTreeIndex.getAllEntries()` — deduplicated dump of every entry across memtable + SSTables
+- `BTreeIndex.getStats()` — debugging snapshot: memtable size/bytes, SSTable count, and per-SSTable soul ranges
+- Config: `memtableSizeLimit`, `memtableFlushFreq`, `sstableMergeThreshold`
+- **Disk-backed SSTable persistence (opt-in):** `new Nevil({ enableSoulIndex: true, sstableDiskEnabled: true, sstableDir })` persists each flushed SSTable to its own JSON file plus a manifest under `sstableDir`; `Storage.load` calls `BTreeIndex.loadFromDisk()` first to give the index a head start from the on-disk snapshot, then still re-adds every replayed log entry to the index (idempotent — a no-op for souls the snapshot already covers). This is required for correctness, not just belt-and-suspenders: any soul that was sitting in the in-memory memtable (never flushed) at the moment of an unclean shutdown is missing from the disk snapshot but IS present in the log, so skipping the per-entry add for those souls would leave them silently absent from the index after restart. `compactSSTables` deletes the old tables' files and persists the merged one when disk mode is on
 - Witness: real boot cycle — write 20 entries (tiny `memtableSizeLimit` forces frequent flush), confirm files land on disk, construct a fresh `Storage` pointed at the same dirs (simulating a restart), confirm the graph replays correctly from the log AND the index restores from disk files with correct `get()` data
 - Fallback correctness: `BTreeIndex.get()` falls back to a linear scan over `sstables` when the binary-search fast path misses, so a lookup stays correct even if `compactSSTables` ever produces overlapping `[minSoul, maxSoul]` ranges (compaction now also selects the two oldest-by-timestamp tables, not always array positions `[0,1]`, fixing both the correctness gap and the doc-claimed-vs-actual merge-selection mismatch)
 
@@ -213,9 +216,9 @@ All 32 formal constraints documented in `.gm/constraints.md`. Verified: idempote
 
 All magic constants exposed via constructor options (no hidden defaults):
 - Network: DHT_K, DHT_L, DHT_GEOHASH_LENGTH, DHT_HEALTH_UPDATE_FREQ, DHT_FALLBACK_THRESHOLD, DHT_ENABLED
-- Graph: CLOCK_MAX_JUMP, CLOCK_FAST_THRESHOLD, CLOCK_CONSENSUS_SPREAD
+- Graph: CLOCK_MAX_JUMP
 - Reputation: REP_*_THRESHOLD, REP_DELTA_*, QUEUE_RETRY_DELAY, QUEUE_MAX_RETRIES
-- Storage: MEMTABLE_SIZE_LIMIT, MEMTABLE_FLUSH_FREQ, SSTABLE_MERGE_THRESHOLD, BLOOM_FILTER_FPR, SSTABLE_BLOCK_SIZE, `fsyncOnWrite`, `sstableDiskEnabled`, `sstableDir`, `peerTableSaveFreq`
+- Storage: MEMTABLE_SIZE_LIMIT, MEMTABLE_FLUSH_FREQ, SSTABLE_MERGE_THRESHOLD, `fsyncOnWrite`, `sstableDiskEnabled`, `sstableDir`, `peerTableSaveFreq`
 - Graph: also `withSoulLock` (per-soul async serialization, opt-in usage not a constructor flag)
 - Reputation: also `compactReputationLog()` (call periodically, mirrors `nevil.compact()`)
 - Conflict resolution: `conflictResolution` ('lww' | 'fww' | custom fn) on `Graph`
@@ -228,7 +231,7 @@ All parameters documented with trade-offs (latency vs bandwidth, throughput vs m
 ## Residuals & Open Questions
 
 Honest residuals (not blockers):
-- B-tree index is in-memory by default; startup is O(n) (log replay) unless `sstableDiskEnabled: true` is set, in which case the index restores from disk in O(sstable count) while the graph itself still always replays the log (log remains the sole correctness source of truth).
+- B-tree index is in-memory and rebuilt via O(n) log replay on every boot; `sstableDiskEnabled: true` gives the index a head start by restoring SSTables from disk in O(sstable count) before replay begins, but replay still re-adds every log entry to the index (idempotent, required for correctness — a soul that was only in the pre-shutdown memtable and never flushed would otherwise be silently missing from the restored index). The graph itself always replays the full log regardless (log remains the sole correctness source of truth); the disk snapshot only reduces the index’s own reconstruction cost, it does not make boot sub-O(n) overall.
 - DHT-aware routing reduces flood-fill traffic to a bounded subset K of healthy connected peers per hop (with flood-fill fallback); base routing is one relay hop, but `dhtMultihopEnabled: true` adds a real bounded (TTL-capped) multi-hop traversal on top, narrowing toward tighter routing-key matches hop by hop — still not a provably O(log peers)-hop DHT in the Kademlia-proof sense, but genuinely multi-hop when enabled.
 - CAP theorem is a hard trade-off, not a limitation to engineer around: the `topology` presets each pick which two of {consistency, availability, partition tolerance} to optimize for — no mode gets all three simultaneously. CA mode enforces a real quorum gate (`quorumFraction: 0.5` by default): `nevil.put()` rejects local writes once fewer than half of `opts.peers` are connected, rather than silently degrading to AP-like always-accept behavior during a partition. This is a real availability sacrifice (CA explicitly does not promise to keep working when partitioned), not just a differently-labeled AP.
 - Proof-of-work difficulty defaults to a static per-network constant; `powAdaptive: true` opts into a live controller that scales difficulty within configured bounds based on observed accepted-put rate, so an operator no longer must manually reconfigure `powDifficulty` + restart to react to a spam surge (though the static mode remains the default for predictable solve-time behavior).

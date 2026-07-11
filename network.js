@@ -49,8 +49,13 @@ class Network {
     this.metrics = { messagesReceived: 0, messagesSent: 0, bytesSent: 0, peersConnected: 0 };
     this.latencies = { send_ms: [], receive_ms: [] }; // ring buffers for latency tracking
     this.maxLatencySamples = 1000; // keep last 1000 samples per operation
+    // Caps the raw WebSocket frame size at the transport layer (ws's own
+    // maxPayload) so a single oversized field value can't be used to exhaust
+    // memory/disk/bandwidth before any application-level check ever runs —
+    // field COUNT was already bounded (graph.js MAX_FIELDS_PER_NODE) but
+    // nothing previously bounded a single field VALUE or the frame as a whole.
+    this.MAX_PAYLOAD_BYTES = opts.maxPayloadBytes || 1024 * 1024; // 1MB default
     this.writeRateScale = 1.0; // adaptive backpressure: scale factor for batch size
-    this.dhtTable = []; // append-only routing table for multi-level DHT
     this.peerHealthScores = new Map(); // peerId -> {latency, loss, lastSeen}
     this.peerRoutingKeys = new Map(); // peerKey -> routing prefix (learned), unknown = include all
     this.dialedUrls = new Set(this.opts.peers || []); // urls we dialed (vs server-attached)
@@ -151,13 +156,14 @@ class Network {
 
   _startServer() {
     const { WebSocketServer } = require('ws');
-    this.wss = new WebSocketServer({ server: this.opts.server, path: '/nevil' });
+    this.wss = new WebSocketServer({ server: this.opts.server, path: '/nevil', maxPayload: this.MAX_PAYLOAD_BYTES });
     this.wss.on('connection', (ws) => this._attach(ws));
   }
 
   _dial(url, attempt = 0) {
+    if (this._closed) return; // a redial timer scheduled before close() must not resurrect a socket after
     const WS = isNode ? require('ws') : WebSocket;
-    const ws = new WS(url);
+    const ws = isNode ? new WS(url, { maxPayload: this.MAX_PAYLOAD_BYTES }) : new WS(url);
     ws._dialUrl = url;
     ws._dialAttempt = attempt;
     this._attach(ws);
@@ -182,10 +188,17 @@ class Network {
       this.sockets.delete(ws);
       this.metrics.peersConnected = this.sockets.size;
       // Self-heal: redial only sockets we initiated (not server-attached).
-      if (ws._dialUrl && !ws._redialScheduled) {
+      // Tracked in _redialTimers (not just left as a bare setTimeout) so
+      // close() can cancel it even though the socket already left `sockets`
+      // by this point — otherwise a redial scheduled just before close()
+      // fires afterward and resurrects a live connection on a torn-down instance.
+      if (ws._dialUrl && !ws._redialScheduled && !this._closed) {
         ws._redialScheduled = true;
         const nextAttempt = (ws._dialAttempt || 0) + 1;
-        setTimeout(() => this._dial(ws._dialUrl, nextAttempt), this._redialDelay(ws._dialAttempt || 0));
+        this._redialTimers = this._redialTimers || new Set();
+        const timer = setTimeout(() => { this._redialTimers.delete(timer); this._dial(ws._dialUrl, nextAttempt); }, this._redialDelay(ws._dialAttempt || 0));
+        if (timer.unref) timer.unref();
+        this._redialTimers.add(timer);
       }
     };
     const handleMessage = (raw) => {
@@ -214,10 +227,28 @@ class Network {
         // real-traffic ACK signal for the DHT_FALLBACK_THRESHOLD timer in
         // broadcast(): it proves at least one peer actually received and
         // is propagating this message, so the flood-fill fallback is unneeded.
-        this._ackedIds = this._ackedIds || new Set();
-        this._ackedIds.add(msg.id);
-        if (this._ackedIds.size > this.maxSeen) this._ackedIds.delete(this._ackedIds.values().next().value);
+        // Only count it if it comes back via a connection we did NOT send
+        // the original directly to — a peer we sent it to trivially echoing
+        // the id straight back proves nothing about real propagation and
+        // would let that single peer forge the ACK for free.
+        const directTargets = this._directSendTargets?.get(msg.id);
+        if (!directTargets || !directTargets.has(this._getPeerKey(ws))) {
+          this._ackedIds = this._ackedIds || new Set();
+          this._ackedIds.add(msg.id);
+          if (this._ackedIds.size > this.maxSeen) this._ackedIds.delete(this._ackedIds.values().next().value);
+        }
         return; // already seen, stop the flood here
+      }
+      // Cheap reputation gate BEFORE expensive signature verification: a
+      // connection already known to be drop-throttled must not force a full
+      // libsodium Ed25519 verify (Buffer allocs + JSON.stringify + native
+      // call) on every message it sends — that lets an already-Byzantine
+      // peer impose disproportionate CPU cost for free. Keyed per CONNECTION
+      // (peerKey), never per claimed msg.sender (attacker-controlled).
+      const connKey = this._getPeerKey(ws);
+      if (this.getThrottleState(connKey) === 'drop') {
+        this.metrics.messagesDropped = (this.metrics.messagesDropped || 0) + 1;
+        return; // cheap drop, no signature/PoW work spent on a blacklisted connection
       }
       // Signature verification: keypear-derived sender authenticity. A `put`
       // targeting a keychain-derived soul (64-hex Ed25519 pubkey) MUST carry a
@@ -228,13 +259,20 @@ class Network {
       // they are unaffected — this only closes the identity-forgery gap.
       if (msg.type === 'put' && this._isKeychainDerived(msg.soul) && !(msg.sender && msg.signature)) {
         this.metrics.signatureDropped = (this.metrics.signatureDropped || 0) + 1;
-        this.updateReputation(this._getPeerKey(ws), this.REP_DELTA_BYZANTINE, 'byzantine');
+        this.updateReputation(connKey, this.REP_DELTA_BYZANTINE, 'byzantine');
         return; // unsigned write to an identity-addressed soul, drop and penalize
       }
-      if (msg.sender && msg.signature && !this._verifySignature(msg.sender, msg, msg.signature)) {
-        this.metrics.signatureDropped = (this.metrics.signatureDropped || 0) + 1;
-        this.updateReputation(msg.sender, this.REP_DELTA_BYZANTINE, 'byzantine');
-        return; // signature failed, drop and penalize sender
+      let senderAuthenticated = false;
+      if (msg.sender && msg.signature) {
+        if (!this._verifySignature(msg.sender, msg, msg.signature)) {
+          this.metrics.signatureDropped = (this.metrics.signatureDropped || 0) + 1;
+          // Penalize the CONNECTION, not msg.sender — sender is unauthenticated
+          // (that's exactly why verification just failed), so an attacker could
+          // otherwise fabricate any victim's soul as sender to frame them.
+          this.updateReputation(connKey, this.REP_DELTA_BYZANTINE, 'byzantine');
+          return; // signature failed, drop and penalize sender
+        }
+        senderAuthenticated = true; // signature present and verified: msg.sender is now trustworthy
       }
       // Lamport clock gate: reject out-of-order or rollback clocks. Keyed per
       // CONNECTION (peerKey), not per claimed `msg.sender` — an unauthenticated
@@ -243,26 +281,38 @@ class Network {
       // shared counter to block others. Per-socket tracking means an attacker
       // can only ever race against their own connection's prior clock.
       if (msg.lamportClock !== undefined) {
-        const connKey = this._getPeerKey(ws);
         const lastClock = this.peerClocks = this.peerClocks || new Map();
         const prior = lastClock.get(connKey) || 0;
         if (msg.lamportClock <= prior) {
           this.metrics.clockDropped = (this.metrics.clockDropped || 0) + 1;
-          this.updateReputation(msg.sender || connKey, this.REP_DELTA_REPLAY, 'replay');
+          // Penalize the CONNECTION, not msg.sender — at this point sender is
+          // only authenticated if a signature was present AND verified above;
+          // an omitted/unsigned sender field is attacker-controlled, so
+          // trusting it here would let an attacker forge a victim's soul as
+          // sender and have the replay penalty charged to the victim instead
+          // of the attacker's own connection (frame-the-victim DoS).
+          this.updateReputation(connKey, this.REP_DELTA_REPLAY, 'replay');
           return; // clock did not advance, possible replay/rollback
         }
         lastClock.set(connKey, msg.lamportClock);
       }
       // PoW verification: when enabled, every write must carry a valid puzzle solution;
       // when a puzzle is present regardless of the flag, verify it (never trust unchecked work).
-      if (this.POW_ENABLED && msg.type === 'put' && !this._verifyPoW(msg.soul, msg.pow)) {
+      if (this.POW_ENABLED && msg.type === 'put' && !this._verifyPoW(msg.soul, msg.pow, msg.id)) {
         this.metrics.powDropped = (this.metrics.powDropped || 0) + 1;
-        this.updateReputation(msg.sender || 'unknown', this.REP_DELTA_BYZANTINE, 'byzantine');
+        // Penalize the CONNECTION, not msg.sender — same rationale as the
+        // signature-failure site above: sender is only authenticated if a
+        // signature was present AND verified, which a PoW-failing message
+        // need not carry. Trusting an unauthenticated sender field here
+        // would let an attacker forge a victim's soul as sender and have
+        // the PoW-fail penalty charged to the victim (frame-the-victim DoS).
+        this.updateReputation(connKey, this.REP_DELTA_BYZANTINE, 'byzantine');
         return; // missing or invalid PoW, drop and penalize sender
       }
-      if (!this.POW_ENABLED && msg.pow && !this._verifyPoW(msg.soul, msg.pow)) {
+      if (!this.POW_ENABLED && msg.pow && !this._verifyPoW(msg.soul, msg.pow, msg.id)) {
         this.metrics.powDropped = (this.metrics.powDropped || 0) + 1;
-        this.updateReputation(msg.sender || 'unknown', this.REP_DELTA_BYZANTINE, 'byzantine');
+        // Penalize the CONNECTION, not msg.sender — see rationale above.
+        this.updateReputation(connKey, this.REP_DELTA_BYZANTINE, 'byzantine');
         return; // PoW failed, drop and penalize sender
       }
       // Reputation gossip: fold in only entries not already applied. Each
@@ -271,10 +321,27 @@ class Network {
       // (peerId+delta+reason+timestamp) before summing — otherwise the same
       // historical delta gets re-added to reputationCache on every repeat
       // delivery, inflating scores far past the true sum of distinct deltas.
+      // Cap incoming reputationLedger length before iterating/relaying: an
+      // honest sender only ever gossips its ledger tail since the last
+      // gossip (bounded by real traffic volume), so an array anywhere near
+      // maxReputationLedger is itself a signal of a crafted oversized
+      // payload — iterating and then JSON.stringify-relaying it to K/all
+      // peers at every hop would otherwise let one small attacker frame
+      // impose O(entries * hops) CPU/bandwidth cost mesh-wide for free.
+      if (msg.reputationLedger && Array.isArray(msg.reputationLedger) && msg.reputationLedger.length > this.maxReputationLedger) {
+        this.updateReputation(connKey, this.REP_DELTA_MALFORMED, 'malformed');
+        return;
+      }
       if (msg.reputationLedger && Array.isArray(msg.reputationLedger)) {
         this._seenReputationEntries = this._seenReputationEntries || new Set();
         for (const entry of msg.reputationLedger) {
-          if (!entry || typeof entry.peerId !== 'string' || typeof entry.delta !== 'number') continue;
+          // Number.isFinite (not just typeof === 'number') excludes
+          // NaN/Infinity/-Infinity, and the magnitude clamp bounds a single
+          // entry's effect — without both, one unauthenticated frame could
+          // permanently poison a peerId's reputation to -Infinity (matching
+          // nevil.js's mergeReputationLedger, which already clamps the same way).
+          if (!entry || typeof entry.peerId !== 'string' || typeof entry.delta !== 'number' || !Number.isFinite(entry.delta)) continue;
+          const delta = Math.max(-100, Math.min(100, entry.delta));
           const entryKey = entry.peerId + '|' + entry.delta + '|' + entry.reason + '|' + entry.timestamp;
           if (this._seenReputationEntries.has(entryKey)) continue;
           this._seenReputationEntries.add(entryKey);
@@ -282,11 +349,16 @@ class Network {
             this._seenReputationEntries.delete(this._seenReputationEntries.values().next().value);
           }
           const sum = this.reputationCache.get(entry.peerId) || 0;
-          this._setReputationCache(entry.peerId, sum + entry.delta);
+          this._setReputationCache(entry.peerId, sum + delta);
         }
       }
-      // Throttle gating: check sender reputation and decide accept/queue/drop
-      const senderId = msg.sender || 'unknown';
+      // Throttle gating: check sender reputation and decide accept/queue/drop.
+      // Only trust msg.sender as the throttle key when it was cryptographically
+      // authenticated above (senderAuthenticated) — otherwise it is
+      // attacker-controlled, and an attacker could forge a victim's soul as
+      // sender to have the victim's reputation/throttle state (rather than
+      // the attacker's own connection's) gate this message.
+      const senderId = senderAuthenticated ? msg.sender : connKey;
       const throttleState = this.getThrottleState(senderId);
       if (throttleState === 'drop') {
         this.metrics.messagesDropped = (this.metrics.messagesDropped || 0) + 1;
@@ -315,7 +387,13 @@ class Network {
       // peerRoutingKeys was previously never populated anywhere, so
       // _getPrefixMatches' bucket-preference always took the "unknown peer:
       // include all" branch and never actually filtered by bucket match.
-      if (msg.soul && this._isKeychainDerived(msg.soul)) {
+      // Restricted to type:'put' — that's the only message shape the
+      // mandatory-signature gate above actually scrutinizes for a
+      // keychain-derived soul; any other/omitted type carrying a fabricated
+      // 64-hex soul would otherwise poison this peer's routing-key entry
+      // with zero authentication, biasing DHT/multi-hop peer selection
+      // toward a Sybil connection for an attacker-chosen bucket.
+      if (msg.type === 'put' && msg.soul && this._isKeychainDerived(msg.soul)) {
         this.peerRoutingKeys.set(peerKey, this._computeGeohash(msg.soul));
       }
       this.onMessage(msg);
@@ -344,6 +422,16 @@ class Network {
     const msg = { id: randomId(), lamportClock: lamportClock || 0, ...payload };
     this._remember(msg.id);
     const routedPeers = this._selectRoutingPeers(msg);
+    // Remember exactly who we sent to, so the ACK check below can require a
+    // loop-back from a peer we did NOT directly send to — a peer we DID send
+    // to trivially echoing the id straight back proves nothing about real
+    // mesh propagation and would let a single connected peer forge the ACK
+    // signal for free with one unauthenticated {id} frame.
+    this._directSendTargets = this._directSendTargets || new Map();
+    this._directSendTargets.set(msg.id, routedPeers);
+    if (this._directSendTargets.size > this.maxSeen) {
+      this._directSendTargets.delete(this._directSendTargets.keys().next().value);
+    }
     this._relay(msg, null);
     // DHT_FALLBACK_THRESHOLD ACK timeout: a DHT-routed (non-flood-fill) send
     // to a bounded peer subset is fire-and-forget with no receipt signal, so
@@ -372,7 +460,7 @@ class Network {
 
   _verifySignature(sender, msg, signature) {
     // Verify message signature: sender is keypear-derived soul (public key hex)
-    // Signature covers: {soul, fields, ts, lamportClock, ...} (everything except id, sender, signature)
+    // Signature covers: {soul, fields, ts, lamportClock, ...} (everything except id, sender, signature, _hops)
     if (!sender || !signature || typeof signature !== 'string') return false;
     let sodium;
     try {
@@ -397,6 +485,11 @@ class Network {
       delete msgCopy.id;
       delete msgCopy.sender;
       delete msgCopy.signature;
+      // _hops is added/incremented by _relayMultiHop AFTER the origin signs,
+      // so it must be excluded the same as id/sender/signature — otherwise a
+      // signed put fails verification at every hop past the first once
+      // dhtMultihopEnabled mutates the message on relay.
+      delete msgCopy._hops;
       const msgBody = JSON.stringify(msgCopy, Object.keys(msgCopy).sort());
       const sigBuf = Buffer.from(signature, 'hex');
       return sodium.crypto_sign_verify_detached(sigBuf, Buffer.from(msgBody), publicKeyBuf);
@@ -418,7 +511,8 @@ class Network {
    * current sliding window. Ratchets by exactly 1 leading-zero-hex-digit per
    * call (roughly 16x expected solve-time change) so a single burst can't
    * whipsaw difficulty; bounded to [POW_DIFFICULTY_MIN, POW_DIFFICULTY_MAX].
-   * Call periodically (see nevil.js wiring) — this method itself has no timer.
+   * Self-scheduled: the constructor sets up its own setInterval (POW_ADAPTIVE_WINDOW_MS)
+   * when powAdaptive is enabled — nevil.js does not call or schedule this.
    */
   _adjustPowDifficulty() {
     if (!this.POW_ADAPTIVE) return this.POW_DIFFICULTY;
@@ -434,23 +528,27 @@ class Network {
     return this.POW_DIFFICULTY;
   }
 
-  _verifyPoW(soul, pow) {
-    // Verify PoW: check that leading_zeros(sha256(soul || nonce)) >= difficulty
+  _verifyPoW(soul, pow, id) {
+    // Verify PoW: check that leading_zeros(sha256(soul || id || nonce)) >= difficulty.
+    // Binding to `id` (a fresh random value per broadcast, already required
+    // and dedup'd via _remember/`seen`) ties one solved puzzle to one
+    // specific message — without it, a puzzle solved once for a soul could
+    // be replayed unlimited times across distinct messages with fresh ids.
     if (!pow || typeof pow.nonce !== 'number' || typeof pow.difficulty !== 'number') return false;
     if (pow.difficulty < this.POW_DIFFICULTY) return false; // can't satisfy the gate with a weaker puzzle
     const crypto = require('crypto');
-    const input = soul + ':' + pow.nonce;
+    const input = soul + ':' + id + ':' + pow.nonce;
     const hash = crypto.createHash('sha256').update(input).digest('hex');
     const leadingZeros = hash.match(/^0*/)[0].length;
     return leadingZeros >= pow.difficulty;
   }
 
-  /** Solve a hashcash-style puzzle for `soul` at `difficulty` leading hex zeros. O(16^difficulty) expected iterations. */
-  static solvePoW(soul, difficulty) {
+  /** Solve a hashcash-style puzzle for `soul`+`id` at `difficulty` leading hex zeros. O(16^difficulty) expected iterations. */
+  static solvePoW(soul, difficulty, id) {
     const crypto = require('crypto');
     let nonce = 0;
     for (;;) {
-      const hash = crypto.createHash('sha256').update(soul + ':' + nonce).digest('hex');
+      const hash = crypto.createHash('sha256').update(soul + ':' + id + ':' + nonce).digest('hex');
       if (hash.match(/^0*/)[0].length >= difficulty) return { nonce, difficulty };
       nonce++;
     }
@@ -527,7 +625,12 @@ class Network {
    * the same message id regardless of hop count.
    */
   _relayMultiHop(msg, exceptSocket) {
-    const hops = (msg._hops || 0) + 1;
+    // A non-numeric attacker-supplied _hops (e.g. a string) would make `+ 1`
+    // silently do string concatenation instead of arithmetic, permanently
+    // defeating the DHT_MAX_HOPS termination bound for that message across
+    // every subsequent hop mesh-wide — coerce to a safe integer instead.
+    const priorHops = typeof msg._hops === 'number' && Number.isFinite(msg._hops) ? msg._hops : 0;
+    const hops = priorHops + 1;
     if (hops > this.DHT_MAX_HOPS) {
       this._relay(msg, exceptSocket); // hop budget exhausted: fall back to a normal single flood from here
       return;
@@ -537,7 +640,7 @@ class Network {
     const candidates = Array.from(this.sockets)
       .filter((ws) => ws !== exceptSocket)
       .map((ws) => ({ ws, pk: this._getPeerKey(ws) }))
-      .filter(({ pk }) => this.peerHealthScores.has(pk) || true);
+      .filter(({ pk }) => this.peerHealthScores.has(pk));
 
     // Prefer peers whose learned routing key matches the target prefix more
     // tightly than a generic flood would — peers with an exact/longer prefix
@@ -669,26 +772,12 @@ class Network {
     const p99recv = this._computePercentile(this.latencies.receive_ms, 99);
     return {
       ...this.metrics,
+      writeRateScale: this.writeRateScale,
       latencies: {
         send_ms: { p50: p50send, p90: p90send, p99: p99send, samples: this.latencies.send_ms.length },
         receive_ms: { p50: p50recv, p90: p90recv, p99: p99recv, samples: this.latencies.receive_ms.length }
       }
     };
-  }
-
-  /** Add DHT routing table entry (append-only): {geohashPrefix, peerId, latency, reputationMin}. */
-  addDHTEntry(geohashPrefix, peerId, latency, reputationMin = 0) {
-    const entry = { geohashPrefix, peerId, latency, reputationMin, timestamp: Date.now() };
-    this.dhtTable.push(entry);
-    return entry;
-  }
-
-  /** Get DHT entries matching soul prefix (L1-L2 lookup). */
-  getDHTMatches(soul, geohashPrefix) {
-    return this.dhtTable.filter(e =>
-      e.geohashPrefix === geohashPrefix ||
-      e.geohashPrefix === soul.substring(0, 4)
-    );
   }
 
   /**
@@ -737,19 +826,34 @@ class Network {
    */
   updateReputation(peerId, delta, reason = 'good') {
     const entry = { peerId, delta, reason, timestamp: Date.now() };
-    this.reputationLedger.push(entry);
-    if (this.reputationLedger.length > this.maxReputationLedger) this.reputationLedger.shift();
+    this._pushReputationLedger(entry);
     const currentRep = this.reputationCache.get(peerId) || 0;
     this._setReputationCache(peerId, currentRep + delta);
     if (this.onReputationDelta) this.onReputationDelta(entry);
     return entry;
   }
 
+  /**
+   * Push onto the bounded reputationLedger FIFO, tracking how many entries
+   * have ever been shifted out. A length-based gossip cursor (nevil.js)
+   * would otherwise silently misalign once shifting starts: `.length` stays
+   * capped at maxReputationLedger while indices keep moving, so a stored
+   * "sent up to length N" cursor no longer names the same position.
+   * `reputationLedgerShifted + reputationLedger.length` is the true total
+   * ever pushed, giving consumers a stable basis to compute what's new.
+   */
+  _pushReputationLedger(entry) {
+    this.reputationLedger.push(entry);
+    if (this.reputationLedger.length > this.maxReputationLedger) {
+      this.reputationLedger.shift();
+      this.reputationLedgerShifted = (this.reputationLedgerShifted || 0) + 1;
+    }
+  }
+
   /** Replay a previously-persisted reputation ledger (called on boot before any live traffic). */
   restoreReputationLedger(entries) {
     for (const entry of entries) {
-      this.reputationLedger.push(entry);
-      if (this.reputationLedger.length > this.maxReputationLedger) this.reputationLedger.shift();
+      this._pushReputationLedger(entry);
       const currentRep = this.reputationCache.get(entry.peerId) || 0;
       this._setReputationCache(entry.peerId, currentRep + entry.delta);
     }
@@ -780,7 +884,12 @@ class Network {
       if (state === 'accept') {
         this.metrics.messagesReceived++;
         this.onMessage(item.msg);
-        this._relay(item.msg, null);
+        if (this.POW_ADAPTIVE && item.msg.type === 'put') this._recordPowRateSample();
+        if (this.DHT_MULTIHOP_ENABLED && this.DHT_ENABLED && this._isKeychainDerived(item.msg.soul)) {
+          this._relayMultiHop(item.msg, null);
+        } else {
+          this._relay(item.msg, null);
+        }
       } else if (state === 'queue' && item.retries < this.QUEUE_MAX_RETRIES) {
         item.retries++;
         remaining.push(item);
@@ -799,11 +908,11 @@ class Network {
     if (this._queueDrainTimer.unref) this._queueDrainTimer.unref();
   }
 
-  /** Decide message throttle state: accept (>=REP_ACCEPT_THRESHOLD), queue ([REP_DROP_THRESHOLD, REP_ACCEPT_THRESHOLD)), or drop (<REP_DROP_THRESHOLD). */
+  /** Decide message throttle state: accept (>=REP_ACCEPT_THRESHOLD), queue ([REP_QUEUE_MIN, REP_ACCEPT_THRESHOLD)), or drop (<REP_QUEUE_MIN). */
   getThrottleState(peerId) {
     const rep = this.getReputation(peerId);
     if (rep >= this.REP_ACCEPT_THRESHOLD) return 'accept';
-    if (rep < this.REP_DROP_THRESHOLD) return 'drop';
+    if (rep < this.REP_QUEUE_MIN) return 'drop';
     return 'queue';
   }
 
@@ -821,8 +930,10 @@ class Network {
    * never exit cleanly without this.
    */
   close() {
+    this._closed = true; // guards _dial against a redial timer that outlives close()
     if (this._queueDrainTimer) { clearTimeout(this._queueDrainTimer); this._queueDrainTimer = null; }
     if (this._powAdjustTimer) { clearInterval(this._powAdjustTimer); this._powAdjustTimer = null; }
+    if (this._redialTimers) { for (const timer of this._redialTimers) clearTimeout(timer); this._redialTimers.clear(); }
     for (const ws of this.sockets) {
       ws._redialScheduled = true; // suppress self-heal redial on close
       try { ws.terminate ? ws.terminate() : ws.close(); } catch { /* already closed */ }
@@ -832,4 +943,4 @@ class Network {
   }
 }
 
-module.exports = { Network, isNode };
+module.exports = { Network, isNode, randomId };

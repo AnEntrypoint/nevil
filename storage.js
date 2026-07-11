@@ -81,8 +81,15 @@ class NodeLogStore {
 
   async compact(entries) {
     const lines = entries.map((e) => JSON.stringify(e)).join('\n') + (entries.length ? '\n' : '');
-    await this.fs.promises.writeFile(this.filePath, lines, 'utf8');
+    // Route through the same _writeQueue as appendEntries() — otherwise a
+    // concurrent in-flight append and this unqueued writeFile race at the OS
+    // level, losing the append entirely or corrupting the log's trailing bytes.
+    this._writeQueue = (this._writeQueue || Promise.resolve()).then(() => this.fs.promises.writeFile(this.filePath, lines, 'utf8'));
+    await this._writeQueue;
   }
+
+  /** No file handle is held open between writes (each appendFile/writeFile call opens and closes its own), so there is nothing to release — present for interface parity with BrowserLogStore.close(). */
+  close() {}
 }
 
 class BrowserLogStore {
@@ -127,15 +134,22 @@ class BrowserLogStore {
   }
 
   async compact(entries) {
-    const db = await this._ready;
-    return new Promise((resolve, reject) => {
+    const run = () => this._ready.then((db) => new Promise((resolve, reject) => {
       const tx = db.transaction('log', 'readwrite');
       const store = tx.objectStore('log');
       store.clear();
       for (const e of entries) store.add(e);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
-    });
+    }));
+    // Same ordering guarantee as appendEntries(): serialize against any in-flight append.
+    this._writeQueue = (this._writeQueue || Promise.resolve()).then(run);
+    return this._writeQueue;
+  }
+
+  /** Release the open IndexedDB connection — without this, a discarded Storage/Nevil instance leaks a connection for the page's lifetime, which can block a later indexedDB.deleteDatabase() or a version-upgrade open from another tab. */
+  close() {
+    this._ready.then((db) => db.close()).catch(() => {});
   }
 }
 
@@ -156,6 +170,13 @@ class Storage {
       this.peerTableLog = new BrowserLogStore(opts.peerTableDbName || `${opts.dbName || 'nevil'}-peers`);
     }
     this.index = opts.enableIndex ? new BTreeIndex(opts) : null;
+  }
+
+  /** Release the three log stores' underlying resources (IndexedDB connections in-browser; a no-op in Node, which holds no file handle open between writes). */
+  close() {
+    this.log.close();
+    this.reputationLog.close();
+    this.peerTableLog.close();
   }
 
   /**
@@ -193,17 +214,19 @@ class Storage {
     const entries = await this.log.readAll();
     const g = new GraphClass(graphOpts);
     // When disk-backed SSTables are enabled, restore the index straight from
-    // its own files instead of rebuilding it entry-by-entry alongside the
-    // graph replay below — this IS the real O(sstable count) boot path for
-    // the index (vs. O(n) log replay) the in-memory-only index couldn't
-    // offer. The graph itself still always replays from the log (the log
-    // remains the sole source of truth for correctness); only the index's
-    // reconstruction work is skipped when a valid disk snapshot exists.
-    const indexRestoredFromDisk = this.index ? await this.index.loadFromDisk() : false;
+    // its own files first — cheaper than rebuilding every soul from scratch.
+    // This is still only a head start, not a substitute for replay: any soul
+    // that was sitting in the in-memory memtable (never flushed) at the time
+    // of an unclean shutdown is absent from the disk snapshot but IS present
+    // in the log, so the per-entry index.add() below always runs regardless
+    // of disk-restore status — add() is idempotent, so re-adding a soul
+    // already covered by a loaded SSTable is harmless, and it's the only way
+    // to backfill souls the disk snapshot missed.
+    if (this.index) await this.index.loadFromDisk();
     for (const entry of entries) {
       try {
         g.mergeNode(entry.soul, entry.fields, entry.ts, entry.lamportClock);
-        if (this.index && !indexRestoredFromDisk) {
+        if (this.index) {
           const node = g.nodes.get(entry.soul);
           const maxTs = node ? maxOf(Object.values(node.state)) : Date.now();
           this.index.add(entry.soul, { data: node?.data ?? null, state: node?.state ?? null, timestamp: maxTs });
@@ -293,10 +316,11 @@ class Storage {
       }
       entries.push({ soul, fields: node.data, ts: node.state, lamportClock: node.lamport });
     }
-    for (const soul of purgedSouls) {
-      graph.nodes.delete(soul);
-      if (this.index) this.index.remove?.(soul);
-    }
+    // Purged souls are deleted from graph.nodes here; the unconditional
+    // index.rebuild(graph) below (not an incremental per-soul removal — no
+    // such method exists on BTreeIndex) is what actually drops them from
+    // the index, since it rebuilds from the already-purged graph.nodes.
+    for (const soul of purgedSouls) graph.nodes.delete(soul);
     await this.log.compact(entries);
     if (this.index) {
       this.index.rebuild(graph);

@@ -64,6 +64,10 @@ function waitFor(predicate, timeoutMs = 3000) {
   });
 }
 
+function waitMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function realInflowTest(port) {
   return new Promise((resolve, reject) => {
     const server = http.createServer();
@@ -74,36 +78,25 @@ function realInflowTest(port) {
         const attacker = new WebSocket('ws://localhost:' + port + '/nevil');
         attacker.on('error', (e) => console.log('  attacker error:', e.message));
 
-        let reputationSet = false;
-        attacker.on('open', () => {
-          if (!reputationSet) return;
-          const bad = {
-            id: 'bad-' + Date.now(),
-            type: 'put',
-            soul: 'k',
-            fields: { v: 1 },
-            sender: 'peerbad',
-            signature: 'deadbeef', // never verifies
-            lamportClock: 1
-          };
-          attacker.send(JSON.stringify(bad));
-        });
-
         await waitFor(() => net.sockets.size > 0, 4000);
 
-        // Peer already below the drop threshold.
-        net.updateReputation('peerbad', -15, 'byzantine');
-        assert.strictEqual(net.getThrottleState('peerbad'), 'drop', 'pre-seeded bad peer is in drop state');
-        const repBefore = net.getReputation('peerbad');
-        reputationSet = true;
-        // Trigger the open handler's send now that reputation is seeded.
+        // Penalties for a bad-signature message are charged to the CONNECTION
+        // (not the unauthenticated msg.sender field — otherwise an attacker
+        // could frame an arbitrary victim identity by fabricating `sender`).
+        // The connection starts neutral (reputation 0) so the cheap
+        // already-drop-throttled gate does NOT short-circuit before the
+        // signature check runs — that early-exit path is a distinct,
+        // separately-verified optimization (see below), not this test's target.
+        const connKey = net._getPeerKey(Array.from(net.sockets)[0]);
+        const repBefore = net.getReputation(connKey);
+        const senderRepBefore = net.getReputation('peerbad');
         attacker.send(JSON.stringify({
           id: 'bad-' + Date.now(),
           type: 'put',
           soul: 'k',
           fields: { v: 1 },
           sender: 'peerbad',
-          signature: 'deadbeef',
+          signature: 'deadbeef', // never verifies
           lamportClock: 1
         }));
 
@@ -111,9 +104,29 @@ function realInflowTest(port) {
 
         assert.strictEqual(received, 0, 'dropped bad-signature message must NOT reach onMessage');
         assert((net.metrics.signatureDropped || 0) >= 1, 'signatureDropped counter incremented');
-        const repAfter = net.getReputation('peerbad');
-        assert(repAfter < repBefore, 'network auto-recorded a byzantine delta on the drop');
-        console.log('✓ Real in-flow: bad-signature message dropped, reputation auto-penalized (' + repBefore + ' => ' + repAfter + ')');
+        const repAfter = net.getReputation(connKey);
+        assert(repAfter < repBefore, 'network auto-recorded a byzantine delta on the connection, not the unauthenticated sender field');
+        assert.strictEqual(net.getReputation('peerbad'), senderRepBefore, 'unauthenticated msg.sender must NOT be penalized (would let an attacker frame an arbitrary victim identity)');
+        console.log('✓ Real in-flow: bad-signature message dropped, connection auto-penalized (' + repBefore + ' => ' + repAfter + '), sender field left untouched');
+
+        // Second, separate check: once the CONNECTION itself is drop-throttled,
+        // further messages are cheaply rejected before paying signature-verify
+        // cost at all (no signatureDropped increment, no further Byzantine delta).
+        net.updateReputation(connKey, -15, 'byzantine');
+        assert.strictEqual(net.getThrottleState(connKey), 'drop', 'connection now in drop state');
+        const sigDroppedBefore = net.metrics.signatureDropped;
+        attacker.send(JSON.stringify({
+          id: 'bad2-' + Date.now(),
+          type: 'put',
+          soul: 'k',
+          fields: { v: 1 },
+          sender: 'peerbad',
+          signature: 'deadbeef',
+          lamportClock: 2
+        }));
+        await waitMs(200);
+        assert.strictEqual(net.metrics.signatureDropped, sigDroppedBefore, 'a drop-throttled connection is rejected before signature verification runs');
+        console.log('✓ Real in-flow: already drop-throttled connection short-circuited before signature verification');
 
         attacker.close();
         server.close();

@@ -84,7 +84,11 @@ function applyFilter(node, filter) {
       if ('$gte' in condition && !(v >= condition.$gte)) return false;
       if ('$lt' in condition && !(v < condition.$lt)) return false;
       if ('$lte' in condition && !(v <= condition.$lte)) return false;
-      if ('$in' in condition && (!Array.isArray(condition.$in) || !condition.$in.includes(v))) return false;
+      if ('$in' in condition) {
+        if (!Array.isArray(condition.$in)) return false;
+        const matches = Array.isArray(v) ? v.some((item) => condition.$in.includes(item)) : condition.$in.includes(v);
+        if (!matches) return false;
+      }
     } else if (v !== condition) return false;
   }
   return true;
@@ -122,7 +126,12 @@ function resolveOne(graph, soul, q, depth, maxDepth) {
   const out = { soul, ...selectScalars(node, q.select) };
 
   for (const key of Object.keys(q)) {
-    if (key === 'soul' || key === 'select' || key === 'via' || key === 'list' || key === 'filter' || key === 'sort' || key === 'limit' || key === 'offset') continue;
+    // Reserved query-directive keys, not resolvable as a nested-selection alias.
+    // `souls` is only reserved when it holds the root multi-soul array (the shape
+    // query() passes straight into resolveOne as `q`) — a caller-chosen nested
+    // field literally named `souls` with an object value is a legitimate alias
+    // and must still resolve, so it is excluded from this list, not added to it.
+    if (key === 'soul' || (key === 'souls' && Array.isArray(q.souls)) || key === 'select' || key === 'via' || key === 'list' || key === 'filter' || key === 'sort' || key === 'limit' || key === 'offset') continue;
     const sub = q[key];
     if (!sub || typeof sub !== 'object') continue;
 
@@ -147,8 +156,14 @@ function resolveOne(graph, soul, q, depth, maxDepth) {
         resolved.sort((a, b) => compareSortKeys(a[sortKey], b[sortKey], sortOrder));
       }
 
-      if (sub.offset != null) resolved = resolved.slice(sub.offset);
-      if (sub.limit != null) resolved = resolved.slice(0, sub.limit);
+      if (sub.offset != null) {
+        if (sub.offset < 0) throw new Error('query offset must not be negative');
+        resolved = resolved.slice(sub.offset);
+      }
+      if (sub.limit != null) {
+        if (sub.limit < 0) throw new Error('query limit must not be negative');
+        resolved = resolved.slice(0, sub.limit);
+      }
 
       out[key] = resolved;
     } else if (isRef(raw)) {
@@ -192,8 +207,14 @@ function query(graph, q) {
       results.sort((a, b) => compareSortKeys(a[sortKey], b[sortKey], sortOrder));
     }
 
-    if (q.offset != null) results = results.slice(q.offset);
-    if (q.limit != null) results = results.slice(0, q.limit);
+    if (q.offset != null) {
+      if (q.offset < 0) throw new Error('query offset must not be negative');
+      results = results.slice(q.offset);
+    }
+    if (q.limit != null) {
+      if (q.limit < 0) throw new Error('query limit must not be negative');
+      results = results.slice(0, q.limit);
+    }
 
     if (q.mapToRows) {
       return results.map((r) => {
@@ -207,8 +228,9 @@ function query(graph, q) {
   }
   if (!q.soul) throw new Error('query requires either `soul` or `souls`');
   const result = resolveOne(graph, q.soul, q, 0);
+  if (result === null) return null;
 
-  if (q.mapToRows && result) {
+  if (q.mapToRows) {
     const row = { ...result };
     delete row.soul;
     return row;

@@ -268,20 +268,22 @@ A DHT-aware bounded-subset routing is already on by default (routes keychain-der
 **Current bounded-subset:** O(K) traffic per write for keychain-derived souls (not a provably O(log peers)-hop DHT)
 **Implementation:** Extend `_selectRoutingPeers(soul)` partitioning in network.js; measure via `getMetrics()` with 20+ peer load test.
 
-### 2. Adaptive Backpressure (p99 Latency Bounds)
+### 2. Adaptive Backpressure (p99 Latency Bounds) — Metric only, not yet enforced
 
-Reduce write-rate when p99 latency exceeds target. Scale is graceful degrade, not hard failure:
-- p99 < 50ms: increase write batch size (up to 1.0x)
-- p99 50-100ms: maintain current batch size
-- p99 > 100ms: reduce batch size by 10%
+`network.writeRateScale` starts at 1.0 and `_updateBackpressure()` runs on every `_relay()` call, adjusting the scale factor toward the same target as the description below:
+- p99 < 50ms: relax the scale factor back up (toward 1.0x)
+- p99 50-100ms: hold the current scale factor
+- p99 > 100ms: reduce the scale factor by 10%
+
+`writeRateScale` is exposed via `getMetrics()` for observability, but no send path currently reads it to actually reduce write rate or batch size — it is a live-computed signal, not yet a behavioral throttle.
 
 **Measured p99 baselines (flood-fill, real network):**
 - 2-peer: < 10ms
 - 5-peer: < 20ms
 - 10-peer: < 50ms
-- 20-peer: ~100ms (where write-rate limiter activates)
+- 20-peer: ~100ms (where the scale factor would start dropping, once a send path consumes it)
 
-**Implementation:** Add `writeRateScale` in network.js; measure via `getMetrics()` percentiles.
+**Implementation:** `network.js` `writeRateScale` (initialized alongside the other metrics), `_updateBackpressure()`, called unconditionally at the top of `_relay()`; measure via `getMetrics()` percentiles (`writeRateScale` field).
 
 ### 3. Chaos Replay (Fault Injection + Record-Replay, Debugging Tool)
 
@@ -356,7 +358,7 @@ Eleven limitations have been reclassified as in-scope and fully implemented. Not
 - **Gossip convergence:** Ledger included in network broadcasts; peers merge via reputation tracking
 - **Recovery:** Peers can earn reputation back via good behavior (+1 per good message, +10 for routing help)
 
-**Implementation:** `updateReputation(peerId, delta, reason)`, `getReputation(peerId)`, `getThrottleState(peerId)`, `isByzantineIsolated(peerId)`. Message handler checks throttle state before processing (`_onMessage` lines 115-124). Convergence time: < 1 second on 10-peer network. Witness: `tools/witness-reputation-ledger.js` validates all delta rules and throttle states.
+**Implementation:** `updateReputation(peerId, delta, reason)`, `getReputation(peerId)`, `getThrottleState(peerId)`, `isByzantineIsolated(peerId)`. Message handler checks throttle state before processing (the `handleMessage` closure inside `_attach()`, network.js:355-379 for the sender-keyed accept/queue/drop branch, plus a cheaper connection-keyed drop-only pre-check at network.js:249 before signature/PoW work is spent). Convergence time: < 1 second on 10-peer network. Witness: `tools/witness-reputation-ledger.js` validates all delta rules and throttle states.
 
 **Guarantee:** Gossip convergence to consistent reputation state across all peers. No central authority. Byzantine peers gradually isolated via reputation decay. The ledger is also durably persisted (dedicated append-only log, separate from the graph log) and replayed on boot, so a restart doesn't reset a Byzantine peer back to neutral — see Transcendence 11.
 
@@ -483,7 +485,7 @@ Nevil's constructor accepts a `topology` parameter to name which two of {consist
 This project uses **no synthetic tests**. All validation occurs via real execution and live measurement:
 
 - **Exec witness:** Core logic validated via `exec_js` / `browser` dispatch, executing real code paths with real input and checking output.
-- **Runtime metrics:** Network layer exposes `getMetrics()` returning p50/p90/p99 latencies, message/byte counts, peer health scores. Observed under live load.
+- **Runtime metrics:** Network layer exposes `getMetrics()` returning p50/p90/p99 latencies and message/byte counts; per-peer health scores are tracked separately in `network.peerHealthScores` and surfaced via `getHealthyPeers()`. Observed under live load.
 - **Chaos replay:** `tools/chaos-replay.js` deterministically replays recorded messages with fault injection (10% drop, 50ms jitter, peer kills), verifying consistency convergence without external harness.
 - **Code audit:** All 32 constraints verified statically in [`.gm/constraints.md`](.gm/constraints.md) — idempotence, disjoint state, no UB/races, type safety, uniform style, strict contracts, graceful degradation.
 

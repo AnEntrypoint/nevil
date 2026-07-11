@@ -62,10 +62,21 @@ class BTreeIndex {
   }
 
   async _writeManifest() {
-    const manifest = this.sstables
-      .filter((t) => t._fileId !== undefined)
-      .map((t) => t._fileId);
-    await this.fs.promises.writeFile(this.path.join(this.sstableDir, 'manifest.json'), JSON.stringify(manifest), 'utf8');
+    // Serialize concurrent manifest writes the same way NodeLogStore
+    // serializes log appends (storage.js): flushMemtable's fire-and-forget
+    // persist and a synchronous compactSSTables() triggered right after it
+    // can each independently reach this method, and unqueued writeFile calls
+    // have no ordering guarantee, so whichever's OS-level completion lands
+    // last silently wins even if it snapshotted this.sstables first. Reading
+    // this.sstables inside the queued closure (not before enqueuing) ensures
+    // each write reflects the state current at its own turn, not a stale one.
+    this._manifestWriteQueue = (this._manifestWriteQueue || Promise.resolve()).then(() => {
+      const manifest = this.sstables
+        .filter((t) => t._fileId !== undefined)
+        .map((t) => t._fileId);
+      return this.fs.promises.writeFile(this.path.join(this.sstableDir, 'manifest.json'), JSON.stringify(manifest), 'utf8');
+    });
+    await this._manifestWriteQueue;
   }
 
   /** Remove a persisted SSTable's file (called after compaction removes it from memory). */
@@ -86,13 +97,34 @@ class BTreeIndex {
     if (!this.SSTABLE_DISK_ENABLED) return false;
     const manifestPath = this.path.join(this.sstableDir, 'manifest.json');
     if (!this.fs.existsSync(manifestPath)) return false;
-    const manifest = JSON.parse(await this.fs.promises.readFile(manifestPath, 'utf8'));
+    let manifest;
+    try {
+      manifest = JSON.parse(await this.fs.promises.readFile(manifestPath, 'utf8'));
+    } catch (err) {
+      // Truncated/corrupt manifest from a crash mid-writeFile — the log is
+      // still the source of truth, so report no valid snapshot and let the
+      // caller fall back to a full log replay instead of aborting boot.
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('BTreeIndex: corrupt manifest.json, falling back to log replay', err?.message || err);
+      }
+      return false;
+    }
     this.sstables = [];
     let maxFileId = -1;
     for (const fileId of manifest) {
       const filePath = this.path.join(this.sstableDir, `sstable-${fileId}.json`);
       if (!this.fs.existsSync(filePath)) continue; // torn/missing file — skip, same tolerance as the log's torn-line handling
-      const raw = JSON.parse(await this.fs.promises.readFile(filePath, 'utf8'));
+      let raw;
+      try {
+        raw = JSON.parse(await this.fs.promises.readFile(filePath, 'utf8'));
+      } catch (err) {
+        // Truncated/corrupt SSTable file — skip it, same tolerance as a
+        // missing file above; its souls are still recoverable from the log.
+        if (typeof console !== 'undefined' && console.warn) {
+          console.warn('BTreeIndex: corrupt sstable file, skipping', filePath, err?.message || err);
+        }
+        continue;
+      }
       const table = {
         index: new Map(raw.entries),
         minSoul: raw.minSoul,
@@ -109,6 +141,8 @@ class BTreeIndex {
 
   /** Write entry to memtable. Returns true if a flush should follow. */
   write(soul, entry) {
+    const existing = this.memtable.get(soul);
+    if (existing) this.memtableSize -= soul.length + JSON.stringify(existing).length + 100;
     this.memtable.set(soul, entry);
 
     const entrySize = soul.length + JSON.stringify(entry).length + 100;
@@ -133,13 +167,29 @@ class BTreeIndex {
     }
   }
 
-  /** Rebuild the whole index from a graph (souls only; values are null). */
+  /** Rebuild the whole index from a graph, carrying each node's real data/state. */
   rebuild(graph) {
+    // Every table being cleared here may have a disk file from a prior flush;
+    // rebuild() replaces them all with freshly-flushed tables under new file
+    // ids, so the old files must be deleted or they leak on disk forever
+    // (unlike compactSSTables, which already deletes the tables it replaces).
+    const staleFileIds = this.SSTABLE_DISK_ENABLED
+      ? this.sstables.map((t) => t._fileId).filter((id) => id !== undefined)
+      : [];
     this.memtable.clear();
     this.memtableSize = 0;
     this.sstables = [];
-    for (const soul of graph.nodes.keys()) {
-      this.add(soul);
+    for (const [soul, node] of graph.nodes) {
+      let maxTs = 0;
+      for (const v of Object.values(node.state)) if (v > maxTs) maxTs = v;
+      this.add(soul, { data: node.data, state: node.state, timestamp: maxTs });
+    }
+    if (staleFileIds.length) {
+      Promise.all(staleFileIds.map((id) => this._deleteSSTableFile(id))).catch((err) => {
+        if (typeof console !== 'undefined' && console.error) {
+          console.error('BTreeIndex: failed to delete stale SSTable file during rebuild', err?.message || err);
+        }
+      });
     }
   }
 
@@ -177,11 +227,13 @@ class BTreeIndex {
 
     if (this.SSTABLE_DISK_ENABLED) {
       const fileId = this._nextSstableFileId++;
-      this._persistSSTable(table, fileId).catch((err) => {
-        if (typeof console !== 'undefined' && console.error) {
-          console.error('BTreeIndex: failed to persist SSTable to disk', err?.message || err);
-        }
-      });
+      table._persistPromise = this._persistSSTable(table, fileId)
+        .catch((err) => {
+          if (typeof console !== 'undefined' && console.error) {
+            console.error('BTreeIndex: failed to persist SSTable to disk', err?.message || err);
+          }
+        })
+        .finally(() => { table._persistPromise = null; });
     }
   }
 
@@ -283,7 +335,7 @@ class BTreeIndex {
   }
 
   /** Merge the two oldest (by flush timestamp, not soul-range position) SSTables into one (newer entry wins on tie). */
-  compactSSTables() {
+  async compactSSTables() {
     if (this.sstables.length < 2) return;
 
     // `sstables` is sorted by minSoul for get()'s binary search, not by age —
@@ -309,6 +361,14 @@ class BTreeIndex {
     const old1 = this.sstables[idx1];
     const old2 = this.sstables[idx2];
 
+    // A table just flushed by flushMemtable() may still have its
+    // fire-and-forget disk persist in flight, with _fileId not yet assigned
+    // (set inside _persistSSTable once the write resolves). Wait for it here
+    // so oldFileIds below sees the real id instead of undefined, otherwise
+    // the original file is spliced out of memory but never deleted from disk.
+    if (old1._persistPromise) await old1._persistPromise;
+    if (old2._persistPromise) await old2._persistPromise;
+
     const merged = new Map();
     for (const [soul, entry] of old1.index) merged.set(soul, entry);
     for (const [soul, entry] of old2.index) {
@@ -321,8 +381,14 @@ class BTreeIndex {
     const sorted = Array.from(merged.entries())
       .sort((a, b) => a[0].localeCompare(b[0]));
 
-    // Remove the higher index first so the lower index doesn't shift under it.
-    const [hi, lo] = idx1 > idx2 ? [idx1, idx2] : [idx2, idx1];
+    // Re-locate old1/old2 by identity rather than trusting idx1/idx2: the
+    // await above yields to the event loop, so a concurrent add() may have
+    // spliced this.sstables (inserted a new flush, run its own compaction)
+    // and shifted every position since idx1/idx2 were computed.
+    const pos1 = this.sstables.indexOf(old1);
+    const pos2 = this.sstables.indexOf(old2);
+    if (pos1 === -1 || pos2 === -1) return;
+    const [hi, lo] = pos1 > pos2 ? [pos1, pos2] : [pos2, pos1];
     this.sstables.splice(hi, 1);
     this.sstables.splice(lo, 1);
     const mergedTable = {

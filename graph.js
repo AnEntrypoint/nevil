@@ -30,11 +30,30 @@ function ref(soul) {
   return { [REF]: soul };
 }
 
+/**
+ * JSON.stringify with circular references replaced by a back-reference path
+ * (e.g. "[Circular:root.a.b]") instead of throwing — keeps the HAM tie-break
+ * deterministic and distinguishing for circular values, where a bare
+ * `String(v)` fallback would collapse every plain object to the constant
+ * "[object Object]" and make the tie-break always false regardless of which
+ * value is "incoming", breaking cross-peer convergence.
+ */
+function stringifyCircular(v) {
+  const seen = new Map();
+  return JSON.stringify(v, function replacer(key, val) {
+    if (val !== null && typeof val === 'object') {
+      if (seen.has(val)) return `[Circular:${seen.get(val)}]`;
+      seen.set(val, key ? `${seen.get(this) || 'root'}.${key}` : 'root');
+    }
+    return val;
+  });
+}
+
 /** Canonical comparable form: refs compare by soul, objects by JSON, scalars by String. */
 function canonicalValue(v) {
   if (isRef(v)) return REF + v[REF];
   if (v !== null && typeof v === 'object') {
-    try { return JSON.stringify(v); } catch { return String(v); }
+    try { return JSON.stringify(v); } catch { return stringifyCircular(v); }
   }
   return String(v);
 }
@@ -85,10 +104,11 @@ class Graph {
     this.localClock = 0; // Lamport clock: monotonically increasing counter
     this.opts = opts;
 
-    // Lamport clock configuration (tunable per deployment)
+    // Lamport clock configuration (tunable per deployment). Per-peer clock
+    // monotonicity/replay detection lives in network.js (its own peerClocks
+    // map, matched to its own per-connection message flow) — not duplicated
+    // here, since graph.js has no notion of peer connections.
     this.CLOCK_MAX_JUMP = opts.clockMaxJump || 1000; // max clock steps ahead
-    this.CLOCK_FAST_THRESHOLD = opts.clockFastThreshold || 1000; // steps/sec for Byzantine detection
-    this.peerClocks = new Map(); // peerId -> lastClock seen (for replay detection)
     this.MAX_FIELDS_PER_NODE = opts.maxFieldsPerNode || 1000; // caps synchronous per-message work
 
     // Conflict resolution strategy: 'lww' (default), 'fww', or a custom
@@ -96,6 +116,12 @@ class Graph {
     const strategy = opts.conflictResolution || 'lww';
     this.resolveConflict = typeof strategy === 'function' ? strategy : CONFLICT_STRATEGIES[strategy];
     if (!this.resolveConflict) throw new Error(`unknown conflictResolution strategy: ${strategy}`);
+  }
+
+  _warnRejected(reason) {
+    if (typeof console !== 'undefined' && console.warn) {
+      console.warn(`nevil graph: mergeNode rejected input (${reason})`);
+    }
   }
 
   _ensureNode(soul) {
@@ -167,10 +193,25 @@ class Graph {
    * Lamport value.
    */
   mergeNode(soul, fields, timestamps, lamportClock) {
-    if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) return [];
-    if (timestamps === null || typeof timestamps !== 'object' || Array.isArray(timestamps)) return [];
+    // Never throws: this runs on the untrusted remote path (nevil.js's
+    // _applyRemote calls it directly on network input with no try/catch),
+    // so a malformed message must be rejected, not crash the process. Still
+    // logged distinctly from a legitimate no-op merge — a caller building
+    // directly on mergeNode (unlike put(), which throws before delegating
+    // here) otherwise gets silent, indistinguishable data loss.
+    if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {
+      this._warnRejected('fields must be a plain object');
+      return [];
+    }
+    if (timestamps === null || typeof timestamps !== 'object' || Array.isArray(timestamps)) {
+      this._warnRejected('timestamps must be a plain object');
+      return [];
+    }
     const fieldNames = Object.keys(fields);
-    if (fieldNames.length > this.MAX_FIELDS_PER_NODE) return [];
+    if (fieldNames.length > this.MAX_FIELDS_PER_NODE) {
+      this._warnRejected(`field count ${fieldNames.length} exceeds MAX_FIELDS_PER_NODE (${this.MAX_FIELDS_PER_NODE})`);
+      return [];
+    }
     const perField = lamportClock !== null && typeof lamportClock === 'object';
     let batchClock;
     if (!perField && lamportClock !== undefined) {
@@ -244,7 +285,12 @@ class Graph {
   on(soul, fn) {
     if (!this.listeners.has(soul)) this.listeners.set(soul, new Set());
     this.listeners.get(soul).add(fn);
-    return () => this.listeners.get(soul)?.delete(fn);
+    return () => {
+      const set = this.listeners.get(soul);
+      if (!set) return;
+      set.delete(fn);
+      if (set.size === 0) this.listeners.delete(soul);
+    };
   }
 
   onAny(fn) {

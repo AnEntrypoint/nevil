@@ -82,7 +82,12 @@ const sodium = require('sodium-universal');
 const REQUIRED_SODIUM_FUNCTIONS = [
   'extension_tweak_ed25519_base',
   'extension_tweak_ed25519_sign_detached',
+  'extension_tweak_ed25519_pk_add',
+  'extension_tweak_ed25519_scalar_add',
+  'extension_tweak_ed25519_sk_to_scalar',
   'crypto_sign_verify_detached',
+  'crypto_sign_seed_keypair',
+  'crypto_sign_keypair',
   'crypto_generichash_batch',
   'crypto_scalarmult_base',
   'crypto_box_seal',
@@ -107,7 +112,8 @@ function toBuf(x) {
   if (Buffer.isBuffer(x)) return x;
   if (x instanceof Uint8Array) return Buffer.from(x.buffer, x.byteOffset, x.byteLength);
   if (typeof x === 'string') return Buffer.from(x, 'utf8');
-  throw new TypeError('expected Buffer, Uint8Array, or string');
+  if (typeof x === 'number') return Buffer.from(String(x), 'utf8');
+  throw new TypeError('expected Buffer, Uint8Array, string, or number');
 }
 
 /** A single derived keypair: a public key, and (if writable) the tweaked private scalar. */
@@ -329,7 +335,14 @@ class Keychain {
 
   /** Jump to an absolute keypair/public key, keeping `.home` for navigating back to the root. */
   checkout(publicKeyOrKeyPair) {
-    const target = publicKeyOrKeyPair instanceof KeyPair ? publicKeyOrKeyPair : new KeyPair({ publicKey: toBuf(publicKeyOrKeyPair), scalar: null });
+    let target;
+    if (publicKeyOrKeyPair instanceof KeyPair) {
+      target = publicKeyOrKeyPair;
+    } else {
+      const publicKey = toBuf(publicKeyOrKeyPair);
+      if (publicKey.length !== 32) throw new RangeError('public key must be exactly 32 bytes');
+      target = new KeyPair({ publicKey, scalar: null });
+    }
     const c = Object.create(Keychain.prototype);
     c.home = this.home;
     c.base = target;
