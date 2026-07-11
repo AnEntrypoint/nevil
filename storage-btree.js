@@ -10,6 +10,8 @@
 
 'use strict';
 
+const isNode = typeof window === 'undefined' && typeof process !== 'undefined' && !!process.versions?.node;
+
 class BTreeIndex {
   constructor(opts = {}) {
     this.memtable = new Map(); // soul -> {data, state, timestamp}
@@ -25,6 +27,84 @@ class BTreeIndex {
 
     // SSTables kept sorted ascending by minSoul so get() can binary-search.
     this.sstables = []; // [{index: Map, minSoul, maxSoul, timestamp}]
+
+    // Disk-backed SSTable persistence (opt-in, off by default — the base
+    // index is otherwise purely in-memory, rebuilt from the append-only log
+    // on every boot in O(n)). When enabled, each flushed SSTable is also
+    // serialized to its own file under sstableDir, plus a manifest listing
+    // active table files; loadFromDisk() lets boot restore the index
+    // straight from these files instead of only replaying the full log,
+    // giving a real O(sstable count) boot path for the index specifically
+    // (the log remains the durable source of truth either way).
+    this.SSTABLE_DISK_ENABLED = isNode && opts.sstableDiskEnabled === true;
+    this.sstableDir = opts.sstableDir || './nevil-data/sstables';
+    this._nextSstableFileId = 0;
+    if (this.SSTABLE_DISK_ENABLED) {
+      this.fs = require('fs');
+      this.path = require('path');
+      if (!this.fs.existsSync(this.sstableDir)) this.fs.mkdirSync(this.sstableDir, { recursive: true });
+    }
+  }
+
+  /** Serialize one SSTable to its own file and update the manifest. Fire-and-forget from callers that don't await disk I/O on the hot write path; errors are surfaced via the returned promise for callers that do want to await/catch. */
+  async _persistSSTable(table, fileId) {
+    if (!this.SSTABLE_DISK_ENABLED) return;
+    const filePath = this.path.join(this.sstableDir, `sstable-${fileId}.json`);
+    const serialized = {
+      minSoul: table.minSoul,
+      maxSoul: table.maxSoul,
+      timestamp: table.timestamp,
+      entries: Array.from(table.index.entries()),
+    };
+    await this.fs.promises.writeFile(filePath, JSON.stringify(serialized), 'utf8');
+    table._fileId = fileId;
+    await this._writeManifest();
+  }
+
+  async _writeManifest() {
+    const manifest = this.sstables
+      .filter((t) => t._fileId !== undefined)
+      .map((t) => t._fileId);
+    await this.fs.promises.writeFile(this.path.join(this.sstableDir, 'manifest.json'), JSON.stringify(manifest), 'utf8');
+  }
+
+  /** Remove a persisted SSTable's file (called after compaction removes it from memory). */
+  async _deleteSSTableFile(fileId) {
+    if (!this.SSTABLE_DISK_ENABLED || fileId === undefined) return;
+    const filePath = this.path.join(this.sstableDir, `sstable-${fileId}.json`);
+    try { await this.fs.promises.unlink(filePath); } catch { /* already gone */ }
+  }
+
+  /**
+   * Restore SSTables from disk (called on boot instead of / before log
+   * replay repopulates the memtable) — this is the real O(sstable count)
+   * boot path the in-memory-only index couldn't offer: reading a handful of
+   * pre-sorted SSTable files back is far cheaper than replaying the entire
+   * append-only log to rebuild the index from scratch.
+   */
+  async loadFromDisk() {
+    if (!this.SSTABLE_DISK_ENABLED) return false;
+    const manifestPath = this.path.join(this.sstableDir, 'manifest.json');
+    if (!this.fs.existsSync(manifestPath)) return false;
+    const manifest = JSON.parse(await this.fs.promises.readFile(manifestPath, 'utf8'));
+    this.sstables = [];
+    let maxFileId = -1;
+    for (const fileId of manifest) {
+      const filePath = this.path.join(this.sstableDir, `sstable-${fileId}.json`);
+      if (!this.fs.existsSync(filePath)) continue; // torn/missing file — skip, same tolerance as the log's torn-line handling
+      const raw = JSON.parse(await this.fs.promises.readFile(filePath, 'utf8'));
+      const table = {
+        index: new Map(raw.entries),
+        minSoul: raw.minSoul,
+        maxSoul: raw.maxSoul,
+        timestamp: raw.timestamp,
+        _fileId: fileId,
+      };
+      this._insertSSTable(table);
+      if (fileId > maxFileId) maxFileId = fileId;
+    }
+    this._nextSstableFileId = maxFileId + 1;
+    return true;
   }
 
   /** Write entry to memtable. Returns true if a flush should follow. */
@@ -75,7 +155,7 @@ class BTreeIndex {
     this.sstables.splice(lo, 0, table);
   }
 
-  /** Flush memtable to a new SSTable (in-memory Map). */
+  /** Flush memtable to a new SSTable (in-memory Map). Persists to disk too when SSTABLE_DISK_ENABLED. */
   flushMemtable() {
     if (this.memtable.size === 0) return;
 
@@ -83,16 +163,26 @@ class BTreeIndex {
       .sort((a, b) => a[0].localeCompare(b[0]));
 
     const index = new Map(sorted);
-    this._insertSSTable({
+    const table = {
       index,
       minSoul: sorted[0][0],
       maxSoul: sorted[sorted.length - 1][0],
       timestamp: Date.now()
-    });
+    };
+    this._insertSSTable(table);
 
     this.memtable.clear();
     this.memtableSize = 0;
     this.memtableFlushTime = Date.now();
+
+    if (this.SSTABLE_DISK_ENABLED) {
+      const fileId = this._nextSstableFileId++;
+      this._persistSSTable(table, fileId).catch((err) => {
+        if (typeof console !== 'undefined' && console.error) {
+          console.error('BTreeIndex: failed to persist SSTable to disk', err?.message || err);
+        }
+      });
+    }
   }
 
   /** Get entry for a soul via memtable, then binary search over SSTables. */
@@ -120,6 +210,17 @@ class BTreeIndex {
         const entry = t.index.get(soul);
         if (entry) return entry;
       }
+    }
+    // Fallback linear scan: compaction merges tables by age, not always in a
+    // way that preserves strictly sorted, non-overlapping [minSoul, maxSoul]
+    // ranges relative to every other table (a merged table's new range can
+    // overlap an untouched neighbor at a lower index). The binary search
+    // above is the fast path for the common non-overlapping case; this scan
+    // guarantees correctness even if that invariant is ever violated.
+    for (const t of this.sstables) {
+      if (soul < t.minSoul || soul > t.maxSoul) continue;
+      const entry = t.index.get(soul);
+      if (entry) return entry;
     }
     return undefined;
   }
@@ -181,13 +282,30 @@ class BTreeIndex {
     return out.sort();
   }
 
-  /** Merge the two oldest SSTables into one (newer entry wins on tie). */
+  /** Merge the two oldest (by flush timestamp, not soul-range position) SSTables into one (newer entry wins on tie). */
   compactSSTables() {
     if (this.sstables.length < 2) return;
 
-    // Skip the newest table (last flushed); merge the two oldest.
-    const idx1 = 0;
-    const idx2 = 1;
+    // `sstables` is sorted by minSoul for get()'s binary search, not by age —
+    // merging positions [0,1] merged by soul-range position, not recency,
+    // silently starving tables at higher soul-range positions from ever being
+    // compacted under a write pattern spread across the whole keyspace. Pick
+    // the two lowest-timestamp tables by value instead of by array position.
+    let idx1 = 0;
+    let idx2 = 1;
+    if (this.sstables[idx2].timestamp < this.sstables[idx1].timestamp) {
+      [idx1, idx2] = [idx2, idx1];
+    }
+    for (let i = 2; i < this.sstables.length; i++) {
+      const ts = this.sstables[i].timestamp;
+      if (ts < this.sstables[idx1].timestamp) {
+        idx2 = idx1;
+        idx1 = i;
+      } else if (ts < this.sstables[idx2].timestamp) {
+        idx2 = i;
+      }
+    }
+
     const old1 = this.sstables[idx1];
     const old2 = this.sstables[idx2];
 
@@ -203,13 +321,29 @@ class BTreeIndex {
     const sorted = Array.from(merged.entries())
       .sort((a, b) => a[0].localeCompare(b[0]));
 
-    this.sstables.splice(idx1, 2);
-    this._insertSSTable({
+    // Remove the higher index first so the lower index doesn't shift under it.
+    const [hi, lo] = idx1 > idx2 ? [idx1, idx2] : [idx2, idx1];
+    this.sstables.splice(hi, 1);
+    this.sstables.splice(lo, 1);
+    const mergedTable = {
       index: new Map(sorted),
       minSoul: sorted[0][0],
       maxSoul: sorted[sorted.length - 1][0],
       timestamp: Date.now()
-    });
+    };
+    this._insertSSTable(mergedTable);
+
+    if (this.SSTABLE_DISK_ENABLED) {
+      const oldFileIds = [old1._fileId, old2._fileId].filter((id) => id !== undefined);
+      const fileId = this._nextSstableFileId++;
+      this._persistSSTable(mergedTable, fileId)
+        .then(() => Promise.all(oldFileIds.map((id) => this._deleteSSTableFile(id))))
+        .catch((err) => {
+          if (typeof console !== 'undefined' && console.error) {
+            console.error('BTreeIndex: failed to persist compacted SSTable to disk', err?.message || err);
+          }
+        });
+    }
   }
 
   /** All entries (memtable + all SSTables, deduplicated). */

@@ -90,6 +90,18 @@ class Nevil {
 
   async _boot() {
     this.graph = await this.storage.load(Graph, this.opts);
+
+    // Peer table persistence: resume mesh knowledge from a prior run instead
+    // of only ever dialing opts.peers passed at construction — without this,
+    // a restarted peer forgets every peer it learned about via live traffic
+    // and re-discovers the mesh from scratch each time.
+    const priorPeerTable = await this.storage.loadPeerTable();
+    const configuredPeers = new Set(this.opts.peers || []);
+    const resumedPeers = (priorPeerTable.peerUrls || []).filter((u) => !configuredPeers.has(u));
+    this._bootOpts = resumedPeers.length
+      ? { ...this.opts, peers: [...(this.opts.peers || []), ...resumedPeers] }
+      : this.opts;
+    this._priorRoutingKeys = new Map(priorPeerTable.routingKeys || []);
     // Seed the nevil-level clock from the loaded graph's clock so the two
     // counters (graph.localClock advances on merge; _lamportClock advances
     // on gossip) start in sync instead of _lamportClock resetting to 0
@@ -98,9 +110,25 @@ class Nevil {
     // behind what the graph itself already recorded.
     this._lamportClock = this.graph.localClock;
 
-    this.network = new Network(this.opts, (msg) => {
+    this.network = new Network(this._bootOpts, (msg) => {
       if (msg.type === 'put') this._applyRemote(msg);
     });
+    // Restore previously-learned routing-bucket knowledge (see network.js
+    // peerRoutingKeys) — these keys are keyed by peerKey (address:port),
+    // which is only meaningful once that same peer reconnects, but seeding
+    // them means routing preference is warm from the first message instead
+    // of cold every restart.
+    for (const [pk, rk] of this._priorRoutingKeys) this.network.peerRoutingKeys.set(pk, rk);
+    // Periodically snapshot the live peer table (dialed URLs + learned
+    // routing keys) so the NEXT restart resumes from this run's mesh
+    // knowledge instead of only construction-time opts.peers.
+    this._peerTableSaveTimer = setInterval(() => {
+      const dialedUrls = Array.from(this.network.sockets)
+        .map((ws) => ws._dialUrl)
+        .filter(Boolean);
+      this.storage.savePeerTable(dialedUrls, this.network.peerRoutingKeys).catch(() => {});
+    }, this.opts.peerTableSaveFreq || 30000);
+    if (this._peerTableSaveTimer.unref) this._peerTableSaveTimer.unref();
 
     // Durable reputation ledger: replay before any live traffic so a
     // restarted peer doesn't treat a previously-Byzantine peer as neutral,
@@ -174,6 +202,7 @@ class Nevil {
    * error) would otherwise crash on `this.network` being undefined.
    */
   close() {
+    if (this._peerTableSaveTimer) { clearInterval(this._peerTableSaveTimer); this._peerTableSaveTimer = null; }
     if (this.network) this.network.close();
     if (this._unsubAny) this._unsubAny();
   }
@@ -185,10 +214,22 @@ class Nevil {
     this._suppressBroadcast = false;
     if (changed.length) {
       // persist accepted remote writes too, so every peer's disk log is a full replica,
-      // carrying each changed field's lamport clock so a future boot replays true causal order
+      // carrying each changed field's lamport clock so a future boot replays true causal order.
+      // Persist ONLY the fields HAM actually accepted (`changed`), not the full msg.fields —
+      // msg.fields can include fields HAM correctly rejected as stale (e.g. lost a concurrent
+      // write). Logging those too meant a rejected field still got durably written with no
+      // lamport entry (lamport[field] stayed undefined), so on next boot's replay, mergeNode's
+      // per-field lamport comparison fell through to the ts/lexical tie-break and could let the
+      // previously-rejected write "win" retroactively — a real live-merge-vs-replay divergence.
+      const fields = {};
+      const ts = {};
       const lamport = {};
-      for (const f of changed) lamport[f] = msg.lamportClock;
-      this.storage.persist(msg.soul, msg.fields, msg.ts, lamport).catch((err) => this._onPersistError(err, msg.soul));
+      for (const f of changed) {
+        fields[f] = msg.fields[f];
+        ts[f] = msg.ts[f];
+        lamport[f] = msg.lamportClock;
+      }
+      this.storage.persist(msg.soul, fields, ts, lamport).catch((err) => this._onPersistError(err, msg.soul));
     }
   }
 
@@ -613,10 +654,22 @@ class Nevil {
     return this.putAt(batchPath, fields);
   }
 
+  /**
+   * Guard against the same pre-boot race close() was fixed for: `this.network`
+   * is only assigned inside the async _boot() the constructor kicks off
+   * without awaiting, so any method dereferencing it can be called before
+   * boot completes (e.g. a caller reacting to a synchronous event that fires
+   * before `ready()` resolves).
+   */
+  _requireNetwork(methodName) {
+    if (!this.network) throw new Error(`nevil.${methodName}(): called before boot completed — await ready() first`);
+    return this.network;
+  }
+
   /** Add reputation delta to peer's karma ledger (delegates to network's ledger). */
   addReputation(peerId, delta, reason = '') {
     this._lamportClock++;
-    const entry = this.network.updateReputation(peerId, delta, reason || 'good');
+    const entry = this._requireNetwork('addReputation').updateReputation(peerId, delta, reason || 'good');
     // Persist to graph under ['reputation', peerId] for visibility
     const repPath = ['reputation', peerId];
     this.put(repPath.join(':'), entry);
@@ -625,16 +678,17 @@ class Nevil {
 
   /** Get total reputation for a peer (delegates to network's ledger). */
   getReputation(peerId) {
-    return this.network.getReputation(peerId);
+    return this._requireNetwork('getReputation').getReputation(peerId);
   }
 
   /** Get all reputation entries (gossip sync surface — the network's live ledger). */
   getReputationLedger() {
-    return this.network.reputationLedger;
+    return this._requireNetwork('getReputationLedger').reputationLedger;
   }
 
   /** Merge remote reputation entries into the network ledger (for gossip). */
   mergeReputationLedger(entries) {
+    this._requireNetwork('mergeReputationLedger');
     if (!Array.isArray(entries)) return;
     for (const entry of entries) {
       // Validate shape before applying: an unvalidated caller-supplied

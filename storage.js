@@ -20,11 +20,19 @@ const { BTreeIndex } = require('./storage-btree.js');
 
 const isNode = typeof window === 'undefined' && typeof process !== 'undefined' && !!process.versions?.node;
 
+/** Iterative max, no arg-spread — Math.max(...arr) throws RangeError past the engine's call-stack argument limit for a node with a very large number of changed fields. */
+function maxOf(values) {
+  let m = 0;
+  for (const v of values) if (v > m) m = v;
+  return m;
+}
+
 class NodeLogStore {
-  constructor(filePath) {
+  constructor(filePath, opts = {}) {
     this.fs = require('fs');
     this.path = require('path');
     this.filePath = filePath;
+    this.fsyncOnWrite = !!opts.fsyncOnWrite;
     const dir = this.path.dirname(filePath);
     if (!this.fs.existsSync(dir)) this.fs.mkdirSync(dir, { recursive: true });
     if (!this.fs.existsSync(filePath)) this.fs.writeFileSync(filePath, '');
@@ -36,9 +44,22 @@ class NodeLogStore {
     // ordering guarantee relative to each other, so a fast local write racing
     // an applied remote write could land out of logical order in the log,
     // diverging replay order from live merge order on next boot.
-    this._writeQueue = (this._writeQueue || Promise.resolve()).then(
-      () => this.fs.promises.appendFile(this.filePath, lines, 'utf8')
-    );
+    this._writeQueue = (this._writeQueue || Promise.resolve()).then(async () => {
+      // fsyncOnWrite trades throughput for surviving an OS-level crash (not just
+      // a process crash — the append-only+torn-line format already handles
+      // that): without it, the last buffered-but-unflushed write can be lost.
+      if (this.fsyncOnWrite) {
+        const fh = await this.fs.promises.open(this.filePath, 'a');
+        try {
+          await fh.appendFile(lines, 'utf8');
+          await fh.sync();
+        } finally {
+          await fh.close();
+        }
+      } else {
+        await this.fs.promises.appendFile(this.filePath, lines, 'utf8');
+      }
+    });
     await this._writeQueue;
   }
 
@@ -126,13 +147,35 @@ class BrowserLogStore {
 class Storage {
   constructor(opts = {}) {
     if (isNode) {
-      this.log = new NodeLogStore(opts.file || './nevil-data/log.ndjson');
-      this.reputationLog = new NodeLogStore(opts.reputationFile || './nevil-data/reputation.ndjson');
+      this.log = new NodeLogStore(opts.file || './nevil-data/log.ndjson', { fsyncOnWrite: opts.fsyncOnWrite });
+      this.reputationLog = new NodeLogStore(opts.reputationFile || './nevil-data/reputation.ndjson', { fsyncOnWrite: opts.fsyncOnWrite });
+      this.peerTableLog = new NodeLogStore(opts.peerTableFile || './nevil-data/peers.ndjson', { fsyncOnWrite: opts.fsyncOnWrite });
     } else {
       this.log = new BrowserLogStore(opts.dbName || 'nevil');
       this.reputationLog = new BrowserLogStore(opts.reputationDbName || `${opts.dbName || 'nevil'}-reputation`);
+      this.peerTableLog = new BrowserLogStore(opts.peerTableDbName || `${opts.dbName || 'nevil'}-peers`);
     }
     this.index = opts.enableIndex ? new BTreeIndex(opts) : null;
+  }
+
+  /**
+   * Persist the learned peer table (dialed peer URLs + learned DHT routing
+   * keys) so a restarted peer resumes from prior mesh knowledge instead of
+   * only the peers passed at construction time, re-learning routing keys
+   * from scratch via live traffic every restart. Snapshot-style (like
+   * `compact`), not append-only — the peer table is small, current-state-
+   * only data with no causal-ordering requirement.
+   */
+  async savePeerTable(peerUrls, routingKeys) {
+    const entry = { peerUrls: Array.from(peerUrls), routingKeys: Array.from(routingKeys.entries()) };
+    await this.peerTableLog.compact([entry]);
+  }
+
+  /** Load a previously-persisted peer table. Returns { peerUrls: [], routingKeys: [] } if none was ever saved. */
+  async loadPeerTable() {
+    const entries = await this.peerTableLog.readAll();
+    const entry = entries[entries.length - 1];
+    return entry || { peerUrls: [], routingKeys: [] };
   }
 
   /**
@@ -149,18 +192,32 @@ class Storage {
   async load(GraphClass, graphOpts) {
     const entries = await this.log.readAll();
     const g = new GraphClass(graphOpts);
+    // When disk-backed SSTables are enabled, restore the index straight from
+    // its own files instead of rebuilding it entry-by-entry alongside the
+    // graph replay below — this IS the real O(sstable count) boot path for
+    // the index (vs. O(n) log replay) the in-memory-only index couldn't
+    // offer. The graph itself still always replays from the log (the log
+    // remains the sole source of truth for correctness); only the index's
+    // reconstruction work is skipped when a valid disk snapshot exists.
+    const indexRestoredFromDisk = this.index ? await this.index.loadFromDisk() : false;
     for (const entry of entries) {
       try {
         g.mergeNode(entry.soul, entry.fields, entry.ts, entry.lamportClock);
-        if (this.index) {
+        if (this.index && !indexRestoredFromDisk) {
           const node = g.nodes.get(entry.soul);
-          const maxTs = node ? Math.max(0, ...Object.values(node.state)) : Date.now();
+          const maxTs = node ? maxOf(Object.values(node.state)) : Date.now();
           this.index.add(entry.soul, { data: node?.data ?? null, state: node?.state ?? null, timestamp: maxTs });
         }
-      } catch {
-        // a single structurally-invalid log entry (e.g. missing fields) must
-        // not abort the whole boot replay — skip it and keep going, same
-        // tolerance readAll() already gives a torn/unparseable line.
+      } catch (err) {
+        // mergeNode() itself never throws (invalid fields/timestamps return []
+        // rather than raising), so reaching here means something unexpected —
+        // e.g. this.index.add throwing on a malformed entry. Surface it instead
+        // of silently masking it: a single bad entry still must not abort the
+        // whole boot replay, but a diagnostic trail beats a truncated boot with
+        // no sign anything was skipped.
+        if (typeof console !== 'undefined' && console.warn) {
+          console.warn('storage.load: skipping log entry after unexpected error', entry?.soul, err?.message || err);
+        }
       }
     }
     return g;
@@ -170,7 +227,7 @@ class Storage {
   async persist(soul, fields, ts, lamportClock) {
     await this.log.appendEntries([{ soul, fields, ts, lamportClock }]);
     if (this.index) {
-      const maxTs = ts ? Math.max(0, ...Object.values(ts)) : Date.now();
+      const maxTs = ts ? maxOf(Object.values(ts)) : Date.now();
       this.index.add(soul, { data: fields, state: ts, timestamp: maxTs });
     }
   }
@@ -183,6 +240,32 @@ class Storage {
   /** Replay the persisted reputation ledger — called on boot to rebuild Network's in-memory ledger/cache. */
   async loadReputationLedger() {
     return this.reputationLog.readAll();
+  }
+
+  /**
+   * Rewrite the reputation log to one summed entry per peerId, mirroring
+   * `compact()`'s soul-keyed rewrite but keyed by peerId instead — without
+   * this, a long-running peer with heavy reputation churn grows an
+   * ever-larger append-only reputation log with no bound, unlike the main
+   * graph log which already has this compaction path. The summed entry
+   * preserves the peer's cumulative score (what `restoreReputationLedger`
+   * actually needs) while collapsing however many individual deltas it took
+   * to reach it; the most recent reason/timestamp is kept for diagnostics.
+   */
+  async compactReputationLog() {
+    const entries = await this.reputationLog.readAll();
+    const summed = new Map(); // peerId -> { peerId, delta, reason, timestamp }
+    for (const entry of entries) {
+      if (!entry || typeof entry.peerId !== 'string' || typeof entry.delta !== 'number') continue;
+      const prior = summed.get(entry.peerId);
+      summed.set(entry.peerId, {
+        peerId: entry.peerId,
+        delta: (prior ? prior.delta : 0) + entry.delta,
+        reason: entry.reason,
+        timestamp: entry.timestamp,
+      });
+    }
+    await this.reputationLog.compact(Array.from(summed.values()));
   }
 
   /**

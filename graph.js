@@ -56,7 +56,12 @@ function hamWins(incomingTs, incomingVal, currentTs, currentVal, incomingLamport
   }
   if (incomingTs > currentTs) return true;
   if (incomingTs < currentTs) return false;
-  // exact timestamp tie: deterministic tie-break on canonical value
+  // exact timestamp tie: deterministic tie-break on canonical value.
+  // Numeric values compare numerically first — a lexical string compare
+  // ("9" > "10") would otherwise pick the numerically smaller value.
+  if (typeof incomingVal === 'number' && typeof currentVal === 'number') {
+    return incomingVal > currentVal;
+  }
   return canonicalValue(incomingVal) > canonicalValue(currentVal);
 }
 
@@ -98,6 +103,37 @@ class Graph {
       this.nodes.set(soul, { data: {}, state: {}, lamport: {} });
     }
     return this.nodes.get(soul);
+  }
+
+  /**
+   * Serialize concurrent async merges to the SAME soul. Every public
+   * mutation here already runs to completion synchronously within one
+   * microtask (mergeField/mergeNode contain no `await`), so single-threaded
+   * Node callers are already safe without this — that residual is real and
+   * documented (see AGENTS.md). This exists for the one case that residual
+   * doesn't cover: a caller wrapping mergeNode in their own async pipeline
+   * (e.g. awaiting a signature-verify step per field before calling
+   * mergeNode) where two concurrent async call-chains for the same soul
+   * could otherwise interleave their non-atomic multi-step logic around
+   * mergeNode even though mergeNode itself stays atomic. `withSoulLock`
+   * gives such a caller an explicit, opt-in serialization point per soul
+   * (not global — different souls never block each other) instead of
+   * inventing their own locking or assuming Node's synchronity covers a
+   * multi-await pipeline it doesn't.
+   */
+  async withSoulLock(soul, fn) {
+    this._soulLocks = this._soulLocks || new Map();
+    const prior = this._soulLocks.get(soul) || Promise.resolve();
+    let release;
+    const mine = prior.then(() => new Promise((resolve) => { release = resolve; }));
+    this._soulLocks.set(soul, mine);
+    await prior;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this._soulLocks.get(soul) === mine) this._soulLocks.delete(soul);
+    }
   }
 
   /**
@@ -177,10 +213,18 @@ class Graph {
 
   /** Convenience for local writes: stamps every field with a monotonic ts and advances localClock via mergeNode. */
   put(soul, fields) {
+    if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {
+      throw new TypeError('put(soul, fields): fields must be a plain object');
+    }
     // Monotonic within-process: real ties are broken by the Lamport clock (mergeNode
     // advances localClock on every local write), so this ts only needs to never repeat
     // or go backwards locally — Date.now() alone can repeat under tight-loop writes.
-    this._lastPutTs = Math.max(Date.now(), (this._lastPutTs || 0) + 0.001);
+    // Only ever nudges ahead of Date.now() by the sub-millisecond amount needed to
+    // stay monotonic under a same-millisecond write burst; once real time catches
+    // back up, _lastPutTs tracks Date.now() again instead of drifting away from it
+    // forever (the prior Math.max(Date.now(), prev+0.001) never came back down).
+    const prev = this._lastPutTs || 0;
+    this._lastPutTs = prev < Date.now() ? Date.now() : prev + 0.001;
     const now = this._lastPutTs;
     const timestamps = {};
     for (const f of Object.keys(fields)) timestamps[f] = now;

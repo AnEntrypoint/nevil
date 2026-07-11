@@ -24,6 +24,12 @@ function randomId() {
   return globalThis.crypto.randomUUID ? globalThis.crypto.randomUUID() : Math.random().toString(36).slice(2);
 }
 
+function commonPrefixLength(a, b) {
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return i;
+}
+
 class Network {
   /**
    * @param {object} opts
@@ -62,6 +68,17 @@ class Network {
     this.DHT_FALLBACK_THRESHOLD = opts.dhtFallbackThreshold || 3000; // fallback to broadcast after 3s no ACK
     this.DHT_ENABLED = opts.dhtEnabled !== false; // enable DHT (default true)
 
+    // Hierarchical multi-hop routing (opt-in, off by default — the base DHT
+    // routing above is one relay hop from origin to K peers, not a leveled
+    // scheme). When enabled, a message not yet at a peer whose OWN routing
+    // key fully matches the message's geohash prefix gets re-relayed forward
+    // (not just flooded once) to that receiving peer's own K-healthiest
+    // peers, narrowing hop by hop toward peers whose bucket match is tightest
+    // — a real (bounded, TTL-capped) multi-hop traversal instead of a single
+    // relay from the origin.
+    this.DHT_MULTIHOP_ENABLED = opts.dhtMultihopEnabled === true;
+    this.DHT_MAX_HOPS = opts.dhtMaxHops || 6; // TTL cap so multi-hop relay can't loop/run away
+
     // Lamport clock guards
     this.CLOCK_MAX_JUMP = opts.clockMaxJump || 1000; // max clock steps ahead allowed
     this.CLOCK_FAST_THRESHOLD = opts.clockFastThreshold || 1000; // steps/sec for Byzantine detection
@@ -81,10 +98,31 @@ class Network {
 
     // Proof-of-work rate-limiting (hashcash-style), optional, orthogonal to reputation
     this.POW_ENABLED = opts.powEnabled === true; // default off — reputation ledger alone is the default throttle
-    this.POW_DIFFICULTY = opts.powDifficulty || 4; // leading hex zeros required
+    this.POW_DIFFICULTY = opts.powDifficulty || 4; // leading hex zeros required (adaptive controller adjusts this at runtime when enabled)
+
+    // Adaptive PoW difficulty controller (optional, off by default — the prior
+    // static-only difficulty required an operator to manually reconfigure
+    // powDifficulty + restart to react to an observed spam surge). When
+    // enabled, difficulty auto-scales within [powDifficultyMin,
+    // powDifficultyMax] based on the observed accepted-put rate over a
+    // sliding window: sustained high throughput ratchets difficulty up,
+    // sustained low throughput relaxes it back down, bounded so it can never
+    // runaway past the configured ceiling/floor.
+    this.POW_ADAPTIVE = opts.powAdaptive === true;
+    this.POW_DIFFICULTY_MIN = opts.powDifficultyMin || this.POW_DIFFICULTY;
+    this.POW_DIFFICULTY_MAX = opts.powDifficultyMax || this.POW_DIFFICULTY + 4;
+    this.POW_ADAPTIVE_WINDOW_MS = opts.powAdaptiveWindowMs || 10000;
+    this.POW_ADAPTIVE_HIGH_RATE = opts.powAdaptiveHighRate || 50; // puts/window above which difficulty ratchets up
+    this.POW_ADAPTIVE_LOW_RATE = opts.powAdaptiveLowRate || 5; // puts/window below which difficulty relaxes down
+    this._powPutTimestamps = []; // sliding window of accepted-put arrival times, for rate measurement
 
     if (isNode && this.opts.server) this._startServer();
     for (const url of this.opts.peers || []) this._dial(url);
+
+    if (this.POW_ADAPTIVE) {
+      this._powAdjustTimer = setInterval(() => this._adjustPowDifficulty(), this.POW_ADAPTIVE_WINDOW_MS);
+      if (this._powAdjustTimer.unref) this._powAdjustTimer.unref();
+    }
   }
 
   /**
@@ -117,11 +155,19 @@ class Network {
     this.wss.on('connection', (ws) => this._attach(ws));
   }
 
-  _dial(url) {
+  _dial(url, attempt = 0) {
     const WS = isNode ? require('ws') : WebSocket;
     const ws = new WS(url);
     ws._dialUrl = url;
+    ws._dialAttempt = attempt;
     this._attach(ws);
+  }
+
+  /** Exponential backoff (capped) for redialing a configured peer that keeps failing, instead of a fixed unthrottled 2s retry forever. */
+  _redialDelay(attempt) {
+    const base = this.opts.redialBaseMs || 2000;
+    const cap = this.opts.redialMaxMs || 60000;
+    return Math.min(cap, base * Math.pow(2, attempt));
   }
 
   _attach(ws) {
@@ -131,14 +177,15 @@ class Network {
     // real connected peers by default (no external caller required).
     const peerKey = this._getPeerKey(ws);
     this.updatePeerHealth(peerKey, 0, 0);
-    const handleOpen = () => { this.updatePeerHealth(this._getPeerKey(ws), 0, 0); };
+    const handleOpen = () => { ws._dialAttempt = 0; this.updatePeerHealth(this._getPeerKey(ws), 0, 0); };
     const handleClose = () => {
       this.sockets.delete(ws);
       this.metrics.peersConnected = this.sockets.size;
       // Self-heal: redial only sockets we initiated (not server-attached).
       if (ws._dialUrl && !ws._redialScheduled) {
         ws._redialScheduled = true;
-        setTimeout(() => this._dial(ws._dialUrl), 2000);
+        const nextAttempt = (ws._dialAttempt || 0) + 1;
+        setTimeout(() => this._dial(ws._dialUrl, nextAttempt), this._redialDelay(ws._dialAttempt || 0));
       }
     };
     const handleMessage = (raw) => {
@@ -261,9 +308,22 @@ class Network {
       this.metrics.messagesReceived++;
       const recvMs = Date.now() - recvStart;
       this._recordLatency('receive_ms', recvMs);
-      this.updatePeerHealth(this._getPeerKey(ws), recvMs, 0);
+      const peerKey = this._getPeerKey(ws);
+      this.updatePeerHealth(peerKey, recvMs, 0);
+      if (this.POW_ADAPTIVE && msg.type === 'put') this._recordPowRateSample();
+      // Learn this peer's routing bucket from the souls it actually relays —
+      // peerRoutingKeys was previously never populated anywhere, so
+      // _getPrefixMatches' bucket-preference always took the "unknown peer:
+      // include all" branch and never actually filtered by bucket match.
+      if (msg.soul && this._isKeychainDerived(msg.soul)) {
+        this.peerRoutingKeys.set(peerKey, this._computeGeohash(msg.soul));
+      }
       this.onMessage(msg);
-      this._relay(msg, ws); // flood to every other connected peer
+      if (this.DHT_MULTIHOP_ENABLED && this.DHT_ENABLED && this._isKeychainDerived(msg.soul)) {
+        this._relayMultiHop(msg, ws);
+      } else {
+        this._relay(msg, ws); // flood to every other connected peer
+      }
     };
 
     if (isNode) {
@@ -283,14 +343,20 @@ class Network {
   broadcast(payload, lamportClock) {
     const msg = { id: randomId(), lamportClock: lamportClock || 0, ...payload };
     this._remember(msg.id);
+    const routedPeers = this._selectRoutingPeers(msg);
     this._relay(msg, null);
     // DHT_FALLBACK_THRESHOLD ACK timeout: a DHT-routed (non-flood-fill) send
     // to a bounded peer subset is fire-and-forget with no receipt signal, so
     // a message to an unresponsive bucket could otherwise vanish silently.
     // If no peer relays this id back to us (via _relay's re-broadcast of
     // already-seen ids, tracked in `seen`) within the threshold, re-send as
-    // a true flood-fill to every connected peer.
-    if (this.DHT_ENABLED && this.sockets.size > 0) {
+    // a true flood-fill to every connected peer. Skip scheduling entirely
+    // when the initial routing selection already covered every connected
+    // socket (e.g. a small/fully-connected mesh) — a re-flood there is a
+    // guaranteed duplicate send, since a message can never "loop back" to
+    // us in a mesh where recipients don't relay to their own sender.
+    const allConnectedAlreadyTargeted = routedPeers.size >= this.sockets.size;
+    if (this.DHT_ENABLED && this.sockets.size > 0 && !allConnectedAlreadyTargeted) {
       const timer = setTimeout(() => {
         if (!this._ackedIds?.has(msg.id)) this._relay(msg, null, true);
       }, this.DHT_FALLBACK_THRESHOLD);
@@ -308,8 +374,23 @@ class Network {
     // Verify message signature: sender is keypear-derived soul (public key hex)
     // Signature covers: {soul, fields, ts, lamportClock, ...} (everything except id, sender, signature)
     if (!sender || !signature || typeof signature !== 'string') return false;
+    let sodium;
     try {
-      const sodium = require('sodium-universal');
+      sodium = require('sodium-universal');
+    } catch (e) {
+      // A missing/broken native binding is an ENVIRONMENT failure, not a bad
+      // signature — conflating the two (both silently returning false) would
+      // make a broken sodium install look identical to "every peer is
+      // forging writes", Byzantine-penalizing every legitimate sender with
+      // no diagnostic trail. Fail closed (still reject the write — an
+      // unverifiable signature must never be treated as valid) but log
+      // loudly and distinctly so this is diagnosable instead of silent.
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('nevil network: sodium-universal unavailable, cannot verify signatures — rejecting all signed writes', e?.message || e);
+      }
+      return false;
+    }
+    try {
       const publicKeyHex = sender;
       const publicKeyBuf = Buffer.from(publicKeyHex, 'hex');
       const msgCopy = { ...msg };
@@ -320,8 +401,37 @@ class Network {
       const sigBuf = Buffer.from(signature, 'hex');
       return sodium.crypto_sign_verify_detached(sigBuf, Buffer.from(msgBody), publicKeyBuf);
     } catch (e) {
-      return false;
+      return false; // actual bad signature / malformed hex — normal reject path
     }
+  }
+
+  /** Record one accepted-put arrival for the sliding-window rate used by the adaptive PoW controller. */
+  _recordPowRateSample() {
+    const now = Date.now();
+    this._powPutTimestamps.push(now);
+    const cutoff = now - this.POW_ADAPTIVE_WINDOW_MS;
+    while (this._powPutTimestamps.length && this._powPutTimestamps[0] < cutoff) this._powPutTimestamps.shift();
+  }
+
+  /**
+   * Adjust POW_DIFFICULTY based on the observed accepted-put rate over the
+   * current sliding window. Ratchets by exactly 1 leading-zero-hex-digit per
+   * call (roughly 16x expected solve-time change) so a single burst can't
+   * whipsaw difficulty; bounded to [POW_DIFFICULTY_MIN, POW_DIFFICULTY_MAX].
+   * Call periodically (see nevil.js wiring) — this method itself has no timer.
+   */
+  _adjustPowDifficulty() {
+    if (!this.POW_ADAPTIVE) return this.POW_DIFFICULTY;
+    const now = Date.now();
+    const cutoff = now - this.POW_ADAPTIVE_WINDOW_MS;
+    while (this._powPutTimestamps.length && this._powPutTimestamps[0] < cutoff) this._powPutTimestamps.shift();
+    const rate = this._powPutTimestamps.length;
+    if (rate > this.POW_ADAPTIVE_HIGH_RATE && this.POW_DIFFICULTY < this.POW_DIFFICULTY_MAX) {
+      this.POW_DIFFICULTY++;
+    } else if (rate < this.POW_ADAPTIVE_LOW_RATE && this.POW_DIFFICULTY > this.POW_DIFFICULTY_MIN) {
+      this.POW_DIFFICULTY--;
+    }
+    return this.POW_DIFFICULTY;
   }
 
   _verifyPoW(soul, pow) {
@@ -400,6 +510,56 @@ class Network {
         } catch {
           // dead socket, will be cleaned up by its own close handler
         }
+      }
+    }
+  }
+
+  /**
+   * Hierarchical multi-hop relay: this node just received `msg` and, instead
+   * of only flooding it once to every connected peer (base _relay), forwards
+   * it specifically toward peers whose OWN learned routing bucket is closer
+   * to the message's target geohash than this node's neighbors in general —
+   * repeated at each hop, this narrows the message toward the target bucket
+   * across multiple relay steps rather than being bounded to one hop from
+   * the origin. Bounded by DHT_MAX_HOPS (a hop counter carried on the
+   * message itself) so it can never loop or run away; `_remember`'s dedup
+   * (already applied before this is called) prevents redundant re-relay of
+   * the same message id regardless of hop count.
+   */
+  _relayMultiHop(msg, exceptSocket) {
+    const hops = (msg._hops || 0) + 1;
+    if (hops > this.DHT_MAX_HOPS) {
+      this._relay(msg, exceptSocket); // hop budget exhausted: fall back to a normal single flood from here
+      return;
+    }
+    const forwarded = { ...msg, _hops: hops };
+    const targetPrefix = this._computeGeohash(msg.soul);
+    const candidates = Array.from(this.sockets)
+      .filter((ws) => ws !== exceptSocket)
+      .map((ws) => ({ ws, pk: this._getPeerKey(ws) }))
+      .filter(({ pk }) => this.peerHealthScores.has(pk) || true);
+
+    // Prefer peers whose learned routing key matches the target prefix more
+    // tightly than a generic flood would — peers with an exact/longer prefix
+    // match are "closer" to the target bucket in the multi-hop sense.
+    const scored = candidates.map(({ ws, pk }) => {
+      const rk = this.peerRoutingKeys.get(pk);
+      const matchLen = rk ? commonPrefixLength(rk, targetPrefix) : 0;
+      return { ws, pk, matchLen };
+    }).sort((a, b) => b.matchLen - a.matchLen);
+
+    const K = this.DHT_K;
+    const forwardTo = scored.slice(0, Math.max(K, 1));
+    if (forwardTo.length === 0) return;
+
+    const data = JSON.stringify(forwarded);
+    for (const { ws } of forwardTo) {
+      if (ws.readyState === 1) {
+        try {
+          ws.send(data);
+          this.metrics.messagesSent++;
+          this.metrics.bytesSent += data.length;
+        } catch { /* dead socket, cleaned up by its own close handler */ }
       }
     }
   }
@@ -639,11 +799,11 @@ class Network {
     if (this._queueDrainTimer.unref) this._queueDrainTimer.unref();
   }
 
-  /** Decide message throttle state: accept (>=0), queue ([-10,0)), or drop (<-10). */
+  /** Decide message throttle state: accept (>=REP_ACCEPT_THRESHOLD), queue ([REP_DROP_THRESHOLD, REP_ACCEPT_THRESHOLD)), or drop (<REP_DROP_THRESHOLD). */
   getThrottleState(peerId) {
     const rep = this.getReputation(peerId);
-    if (rep >= 0) return 'accept';
-    if (rep < -10) return 'drop';
+    if (rep >= this.REP_ACCEPT_THRESHOLD) return 'accept';
+    if (rep < this.REP_DROP_THRESHOLD) return 'drop';
     return 'queue';
   }
 
@@ -662,6 +822,7 @@ class Network {
    */
   close() {
     if (this._queueDrainTimer) { clearTimeout(this._queueDrainTimer); this._queueDrainTimer = null; }
+    if (this._powAdjustTimer) { clearInterval(this._powAdjustTimer); this._powAdjustTimer = null; }
     for (const ws of this.sockets) {
       ws._redialScheduled = true; // suppress self-heal redial on close
       try { ws.terminate ? ws.terminate() : ws.close(); } catch { /* already closed */ }

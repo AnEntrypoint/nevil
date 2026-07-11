@@ -59,6 +59,8 @@ function compareSortKeys(av, bv, sortOrder) {
   return sortOrder === 'desc' ? -cmp : cmp;
 }
 
+const FILTER_OPERATORS = new Set(['$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$in']);
+
 function applyFilter(node, filter) {
   if (!filter) return true;
   if (!node) return false;
@@ -66,6 +68,16 @@ function applyFilter(node, filter) {
     if (!(key in node)) return false;
     const v = node[key];
     if (typeof condition === 'object' && condition !== null) {
+      // An unrecognized operator key (e.g. a misspelled `$regex`) was
+      // previously silently ignored — every condition using it degraded to
+      // "no constraint", giving false-positive matches instead of surfacing
+      // the mistake. A structurally-valid condition object must use only
+      // known operators.
+      for (const opKey of Object.keys(condition)) {
+        if (!FILTER_OPERATORS.has(opKey)) {
+          throw new Error(`query filter: unrecognized operator "${opKey}" on field "${key}"`);
+        }
+      }
       if ('$eq' in condition && v !== condition.$eq) return false;
       if ('$ne' in condition && v === condition.$ne) return false;
       if ('$gt' in condition && !(v > condition.$gt)) return false;
@@ -163,7 +175,17 @@ function resolveOne(graph, soul, q, depth, maxDepth) {
 function query(graph, q) {
   let results;
   if (Array.isArray(q.souls)) {
-    results = q.souls.map((soul) => resolveOne(graph, soul, q, 0)).filter((r) => r !== null);
+    // Dedup duplicate souls in the input array — the nested `list`-selection
+    // path in resolveOne already dedupes via `seenSouls`; this top-level
+    // multi-soul path previously didn't, so `{ souls: ['a','a','b'] }`
+    // returned soul 'a' twice while the equivalent nested case wouldn't.
+    const seenSouls = new Set();
+    const dedupedSouls = q.souls.filter((s) => {
+      if (seenSouls.has(s)) return false;
+      seenSouls.add(s);
+      return true;
+    });
+    results = dedupedSouls.map((soul) => resolveOne(graph, soul, q, 0)).filter((r) => r !== null);
 
     if (q.sort) {
       const [sortKey, sortOrder] = Array.isArray(q.sort) ? q.sort : [q.sort, 'asc'];

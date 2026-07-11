@@ -36,9 +36,6 @@ All design decisions hold against formal constraints (`.gm/constraints.md`). 32 
 | Query | `query.js` | GraphQL-shaped nested selection with filter/sort/limit/offset |
 | Composite | `nevil.js` | Wires all layers into one public API, resolves topology mode presets |
 
-Supporting:
-- `keychain-invariants.js` — derivation security property checks (audit only, not used at runtime)
-
 ## API Surface
 
 - `close()` — tears down the network layer (all open sockets, the queue-drain timer, and any attached `WebSocketServer`) and unsubscribes graph listeners, so an embedding process can exit cleanly instead of an open socket/timer handle keeping the event loop alive indefinitely; safe to call before `ready()` resolves (the constructor kicks off boot asynchronously without awaiting it, so `this.network` may not exist yet)

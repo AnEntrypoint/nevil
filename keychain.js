@@ -72,6 +72,37 @@
 
 const sodium = require('sodium-universal');
 
+// Required functions from the Holepunch libsodium fork extension this module
+// depends on (see file header: extension_tweak_ed25519_* is not standard
+// libsodium). If the native binding is missing or a future sodium-universal
+// version changes its ABI, calls deep inside sign/derive would otherwise
+// throw a cryptic "not a function" far from the actual cause. Checked once,
+// eagerly, at module load — fail loud and specific instead of a confusing
+// crash the first time an identity is derived or a message is signed.
+const REQUIRED_SODIUM_FUNCTIONS = [
+  'extension_tweak_ed25519_base',
+  'extension_tweak_ed25519_sign_detached',
+  'crypto_sign_verify_detached',
+  'crypto_generichash_batch',
+  'crypto_scalarmult_base',
+  'crypto_box_seal',
+  'crypto_box_seal_open',
+];
+
+function checkSodiumHealth() {
+  const missing = REQUIRED_SODIUM_FUNCTIONS.filter((name) => typeof sodium[name] !== 'function');
+  if (missing.length) {
+    throw new Error(
+      `keychain.js: sodium-universal is missing required function(s): ${missing.join(', ')}. ` +
+      `This module depends on the Holepunch libsodium fork's extension_tweak_ed25519_* ` +
+      `functions (see file header) — a partial/incompatible install after a bad upgrade, or ` +
+      `a missing native binding, would otherwise fail deep inside sign()/derive() with a ` +
+      `cryptic error far from this actual cause.`
+    );
+  }
+}
+checkSodiumHealth();
+
 function toBuf(x) {
   if (Buffer.isBuffer(x)) return x;
   if (x instanceof Uint8Array) return Buffer.from(x.buffer, x.byteOffset, x.byteLength);
@@ -165,6 +196,14 @@ class KeyPair {
  */
 function encryptFor(boxPublicKey, message) {
   const xpk = toBuf(boxPublicKey);
+  if (xpk.length !== sodium.crypto_box_PUBLICKEYBYTES) {
+    throw new Error(
+      `encryptFor: recipient box public key must be ${sodium.crypto_box_PUBLICKEYBYTES} bytes ` +
+      `(got ${xpk.length}) — the recipient must have published a valid key via boxPublicKeyAt() ` +
+      `first; a missing/truncated/malformed published key produces this error instead of an ` +
+      `opaque libsodium failure deeper in crypto_box_seal`
+    );
+  }
   const pt = toBuf(message);
   const sealed = Buffer.alloc(pt.length + sodium.crypto_box_SEALBYTES);
   sodium.crypto_box_seal(sealed, pt, xpk);
@@ -311,4 +350,4 @@ class Keychain {
   }
 }
 
-module.exports = { Keychain, KeyPair, encryptFor };
+module.exports = { Keychain, KeyPair, encryptFor, checkSodiumHealth };
