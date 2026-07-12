@@ -359,10 +359,19 @@ class Nevil {
       const fields = {};
       const ts = {};
       const lamport = {};
+      // Persist the CLAMPED per-field lamport mergeNode actually stored, read
+      // back from the graph node — NOT the raw incoming msg.lamportClock. A
+      // Byzantine over-jump (clock > localClock + CLOCK_MAX_JUMP) is clamped by
+      // mergeNode before it lands, so the live graph holds the clamped value;
+      // persisting the raw scalar instead would put a higher clock on disk than
+      // was ever live, and on reboot replay could let the clamped-out write
+      // regain HAM advantage — a live-merge-vs-replay divergence. Mirrors the
+      // local onAny path, which already reads graphNode.lamport[f].
+      const graphNode = this.graph.nodes.get(msg.soul);
       for (const f of changed) {
         fields[f] = msg.fields[f];
         ts[f] = msg.ts[f];
-        lamport[f] = msg.lamportClock;
+        lamport[f] = graphNode?.lamport[f];
       }
       this._trackPersist(this.storage.persist(msg.soul, fields, ts, lamport).catch((err) => this._onPersistError(err, msg.soul)));
     }

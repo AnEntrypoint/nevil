@@ -872,7 +872,7 @@ class Network {
       const peerKey = this._getPeerKey(ws);
       if (targetPeers && !targetPeers.has(peerKey) && this.DHT_ENABLED) continue;
 
-      const state = isNode ? ws.readyState : ws.readyState;
+      const state = ws.readyState;
       if (state === 1 /* OPEN */) {
         try {
           ws.send(data);
@@ -1088,16 +1088,6 @@ class Network {
       const scoreB = b[1].latency - (100 * b[1].loss);
       return scoreA - scoreB;
     }).map(p => p[0]);
-  }
-
-  /** Update reputation cache (pull from gossip). */
-  updateReputationCache(peerId, reputation) {
-    this._setReputationCache(peerId, reputation);
-  }
-
-  /** Get cached reputation for peer. */
-  getReputationCache(peerId) {
-    return this.reputationCache.get(peerId) || 0;
   }
 
   /**
