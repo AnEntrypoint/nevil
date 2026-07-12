@@ -5,7 +5,7 @@ node_modules/
 load-test-logs/
 nevil-data/
 chaos-replay-logs/
-bash.exe.stackdump
+*.stackdump
 test-nevil-witness.ndjson
 .witness-tmp-log.ndjson
 .witness-int-*.ndjson

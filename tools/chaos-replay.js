@@ -11,6 +11,23 @@ const Nevil = require('../nevil');
 
 let messageIndex = 0;
 
+/**
+ * A seeded PRNG (mulberry32) so fault injection is genuinely deterministic — the
+ * same seed replays the exact same drop set and peer routing every run, which is
+ * what "deterministic replay" (this file's whole point, and nevil's no-flaky
+ * discipline) requires. Math.random() would make both the dropped-message set
+ * and the CLI's converged/exit-code non-reproducible across runs.
+ */
+function seededRandom(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 function recordMessage(msg, senderIdx) {
   const logFile = './chaos-messages.ndjson';
   const entry = {
@@ -23,7 +40,8 @@ function recordMessage(msg, senderIdx) {
 }
 
 async function chaosReplay(opts = {}) {
-  const { logFile = './chaos-messages.ndjson', dropRate = 0.1, jitterMs = 50, peersCount = 5 } = opts;
+  const { logFile = './chaos-messages.ndjson', dropRate = 0.1, jitterMs = 50, peersCount = 5, seed = 1 } = opts;
+  const rand = seededRandom(seed);
 
   if (!fs.existsSync(logFile)) {
     console.log(`No message log at ${logFile}. Run a normal scenario first to record.`);
@@ -61,8 +79,8 @@ async function chaosReplay(opts = {}) {
   // Replay messages with fault injection
   let droppedCount = 0;
   for (const msg of messages) {
-    // Fault injection: drop by rate
-    if (Math.random() < dropRate) {
+    // Fault injection: drop by rate (seeded — same seed drops the same set)
+    if (rand() < dropRate) {
       droppedCount++;
       continue;
     }
@@ -75,7 +93,7 @@ async function chaosReplay(opts = {}) {
 
     // Replay to random peer (simulates receive)
     if (msg.type === 'put' && msg.soul) {
-      const peerIdx = msg._senderIdx !== undefined ? msg._senderIdx : Math.floor(Math.random() * peers.length);
+      const peerIdx = msg._senderIdx !== undefined ? msg._senderIdx : Math.floor(rand() * peers.length);
       if (peers[peerIdx]) {
         peers[peerIdx]._applyRemote(msg);
       }

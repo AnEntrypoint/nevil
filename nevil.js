@@ -277,7 +277,11 @@ class Nevil {
     // of a network/timer/listener that this call already intended to tear down.
     this._closed = true;
     if (this._peerTableSaveTimer) { clearInterval(this._peerTableSaveTimer); this._peerTableSaveTimer = null; }
-    if (this.network) this.network.close();
+    // network.close() returns a promise only when an iroh Endpoint must be torn
+    // down (async); ws-only returns undefined. Await either so a graceful
+    // shutdown never leaks a live QUIC endpoint/accept loop keeping the event
+    // loop alive — Promise.resolve(undefined) awaits to undefined harmlessly.
+    if (this.network) await Promise.resolve(this.network.close());
     if (this._unsubAny) this._unsubAny();
     // Wait for every tracked fire-and-forget persist() call to at least
     // settle (each one's own .catch already routes failures to
@@ -287,6 +291,22 @@ class Nevil {
     // storage.close()'s queue-based drain alone.
     if (this._pendingPersists.size) await Promise.all(this._pendingPersists);
     if (this.storage) await this.storage.close();
+  }
+
+  /**
+   * This node's dialable iroh address (EndpointAddr) when irohEnabled, else null.
+   * A peer publishes/shares this so another node can reach it over QUIC via
+   * irohPeers at construction or dialIroh() at runtime — the iroh analogue of a
+   * ws:// URL, but Ed25519-addressed and NAT-traversable.
+   */
+  async irohNodeAddr() {
+    return this.network ? this.network.irohNodeAddr() : null;
+  }
+
+  /** Dial an iroh peer at runtime by its EndpointAddr (from a peer's irohNodeAddr()). */
+  async dialIroh(endpointAddr) {
+    if (!this.network) throw new Error('nevil: network not ready');
+    return this.network.dialIroh(endpointAddr);
   }
 
   _applyRemote(msg) {

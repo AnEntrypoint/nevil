@@ -77,7 +77,6 @@ class Network {
     this.writeRateScale = 1.0; // adaptive backpressure: scale factor for batch size
     this.peerHealthScores = new Map(); // peerId -> {latency, loss, lastSeen}
     this.peerRoutingKeys = new Map(); // peerKey -> routing prefix (learned), unknown = include all
-    this.dialedUrls = new Set(this.opts.peers || []); // urls we dialed (vs server-attached)
     this.reputationLedger = []; // bounded: {peerId, delta, reason, ts}
     this.maxReputationLedger = opts.maxReputationLedger || 20000; // FIFO cap on in-memory ledger (durable log is unaffected, see storage.js)
     this.reputationCache = new Map(); // peerId -> total reputation sum (sum of all deltas)
@@ -111,7 +110,6 @@ class Network {
     this.DHT_K = opts.dhtK || 3; // K-nearest peers per bucket
     this.DHT_L = opts.dhtL || 2; // L adjacent buckets to gossip to
     this.DHT_GEOHASH_LENGTH = opts.dhtGeohashLength || 4; // geohash precision (4-8 chars)
-    this.DHT_HEALTH_UPDATE_FREQ = opts.dhtHealthUpdateFreq || 5000; // update health every 5s
     this.DHT_FALLBACK_THRESHOLD = opts.dhtFallbackThreshold || 3000; // fallback to broadcast after 3s no ACK
     this.DHT_ENABLED = opts.dhtEnabled !== false; // enable DHT (default true)
 
@@ -180,6 +178,14 @@ class Network {
     if (isNode && this.opts.server) this._startServer();
     for (const url of this.opts.peers || []) this._dial(url);
 
+    // Optional iroh QUIC transport (Node only, opt-in). Started asynchronously
+    // (Endpoint.bind() is async); iroh sockets are _attach()ed exactly like ws
+    // sockets, so routing/reputation/PoW ride on top unchanged. _irohReady is
+    // exposed so close() and irohNodeAddr() can await binding regardless of when
+    // they're called relative to the async bind completing.
+    this.IROH_ENABLED = isNode && opts.irohEnabled === true;
+    if (this.IROH_ENABLED) this._irohReady = this._startIroh();
+
     if (this.POW_ADAPTIVE) {
       this._powAdjustTimer = setInterval(() => this._adjustPowDifficulty(), this.POW_ADAPTIVE_WINDOW_MS);
       if (this._powAdjustTimer.unref) this._powAdjustTimer.unref();
@@ -232,6 +238,47 @@ class Network {
     ws._dialUrl = url;
     ws._dialAttempt = attempt;
     this._attach(ws);
+  }
+
+  /**
+   * Bind the iroh Endpoint and dial any configured iroh peers. Each accepted or
+   * dialed connection arrives as a ws-like IrohSocket handed to _attach(), so the
+   * entire admission pipeline (signature verify, PoW gate, reputation throttle,
+   * maxPayload, DHT routing) treats it identically to a ws socket — the transport
+   * swap changes bytes-on-wire only. opts: irohSecretKey (32-byte Ed25519 seed,
+   * defaults to an ephemeral key), irohRelay (default true — n0 relay-assisted
+   * hole-punching; set false for direct/LAN-only), irohPeers (array of dialable
+   * EndpointAddr objects from other nodes' irohNodeAddr()).
+   */
+  async _startIroh() {
+    const { create } = require('./iroh-transport');
+    this._irohTransport = await create({
+      secretKey: this.opts.irohSecretKey,
+      relay: this.opts.irohRelay !== false,
+      maxPayloadBytes: this.MAX_PAYLOAD_BYTES,
+      onSocket: (sock) => { if (!this._closed) this._attach(sock); },
+    });
+    if (this._closed) { try { await this._irohTransport.close(); } catch {} return this._irohTransport; }
+    for (const addr of this.opts.irohPeers || []) {
+      try { await this._irohTransport.dial(addr); } catch (e) {
+        if (typeof console !== 'undefined' && console.error) console.error('nevil network: iroh dial failed', e?.message || e);
+      }
+    }
+    return this._irohTransport;
+  }
+
+  /** Dial an iroh peer at runtime by its EndpointAddr (from a peer's irohNodeAddr()). */
+  async dialIroh(endpointAddr) {
+    if (!this.IROH_ENABLED) throw new Error('nevil: dialIroh requires irohEnabled');
+    if (this._irohReady) await this._irohReady;
+    if (this._irohTransport) await this._irohTransport.dial(endpointAddr);
+  }
+
+  /** This node's dialable iroh address (EndpointAddr), for a peer to irohPeers/dialIroh. */
+  async irohNodeAddr() {
+    if (!this.IROH_ENABLED) return null;
+    if (this._irohReady) await this._irohReady;
+    return this._irohTransport ? this._irohTransport.addr() : null;
   }
 
   /** Exponential backoff (capped) for redialing a configured peer that keeps failing, instead of a fixed unthrottled 2s retry forever. */
@@ -338,8 +385,17 @@ class Network {
         const digestMatches = expectedDigest === undefined || expectedDigest === canonicalJSON({ soul: msg.soul, fields: msg.fields, ts: msg.ts });
         if (notADirectTarget && digestMatches) {
           this._ackedIds = this._ackedIds || new Set();
+          const firstAck = !this._ackedIds.has(msg.id);
           this._ackedIds.add(msg.id);
           if (this._ackedIds.size > this.maxSeen) this._ackedIds.delete(this._ackedIds.values().next().value);
+          // This peer re-delivered a message carrying the original body via a
+          // path we did NOT send it directly — proof it actually relayed real
+          // traffic on our behalf, the exact 'routing-help' the reputation
+          // ledger documents. REP_DELTA_ROUTING_HELP was previously never
+          // awarded anywhere, so the positive routing incentive was dead. Award
+          // it only on the FIRST loop-back of a given id, so a peer echoing the
+          // same id repeatedly can't farm unbounded routing reputation.
+          if (firstAck) this.updateReputation(this._getPeerKey(ws), this.REP_DELTA_ROUTING_HELP, 'routing-help');
         }
         return; // already seen, stop the flood here
       }
@@ -557,6 +613,16 @@ class Network {
         this.peerRoutingKeys.set(peerKey, this._computeGeohash(msg.soul));
       }
       this.onMessage(msg);
+      // Reward the sender for a valid, first-seen, fully-gated put. Previously
+      // every internal updateReputation call was a PENALTY (malformed/byzantine/
+      // replay) and REP_DELTA_GOOD ('good', the documented "valid write" reward)
+      // was never awarded anywhere — so a well-behaved peer stayed pinned at 0
+      // and could never build a positive buffer to absorb a later isolated
+      // penalty, making the reputation ledger a one-way ratchet toward drop.
+      // Keyed on senderId with the same authenticated-vs-connKey rule as the
+      // throttle gate, so an unauthenticated peer can't farm reputation for a
+      // forged victim soul.
+      if (msg.type === 'put') this.updateReputation(senderId, this.REP_DELTA_GOOD, 'good');
       if (this.DHT_MULTIHOP_ENABLED && this.DHT_ENABLED && this._isKeychainDerived(msg.soul)) {
         this._relayMultiHop(msg, ws);
       } else {
@@ -877,6 +943,10 @@ class Network {
   }
 
   _getPeerKey(ws) {
+    // An iroh socket carries a stable Ed25519 EndpointId-derived key (set once at
+    // registration) — unlike ws's ephemeral address:port, it identifies the same
+    // physical peer across reconnects, so reputation/routing key it consistently.
+    if (ws._peerKey) return ws._peerKey;
     // Get unique identifier for peer (address:port or UUID in browser)
     if (isNode && ws._socket) {
       return ws._socket.remoteAddress + ':' + ws._socket.remotePort;
@@ -943,11 +1013,15 @@ class Network {
   }
 
   _computeGeohash(soul) {
-    // Simplified geohash: use first 4 chars of soul if hex, else hash it
+    // Bucket precision honors the documented dhtGeohashLength knob (this.DHT_
+    // GEOHASH_LENGTH) instead of a hardcoded 4 — previously the config option
+    // was accepted and stored but the two geohash paths both hardcoded a
+    // 4-char prefix, so setting dhtGeohashLength had no effect on bucketing.
+    const len = this.DHT_GEOHASH_LENGTH;
     if (this._isKeychainDerived(soul)) {
-      return soul.substring(0, 4);
+      return soul.substring(0, len);
     }
-    // Fallback: FNV-1a over the FULL soul (not just its first 4 chars) —
+    // Fallback: FNV-1a over the FULL soul (not just its first chars) —
     // hashing only a short prefix meant distinct souls sharing that prefix
     // collided into the same bucket regardless of the rest of the string.
     let hash = 0x811c9dc5;
@@ -955,7 +1029,7 @@ class Network {
       hash ^= soul.charCodeAt(i);
       hash = Math.imul(hash, 0x01000193);
     }
-    return (hash >>> 0).toString(16).padStart(8, '0').substring(0, 4);
+    return (hash >>> 0).toString(16).padStart(8, '0').substring(0, len);
   }
 
   _recordLatency(op, ms) {
@@ -1160,6 +1234,17 @@ class Network {
     }
     this.sockets.clear();
     if (this.wss) { try { this.wss.close(); } catch { /* already closed */ } }
+    // Tear down the iroh Endpoint + accept loop (async) so no QUIC handle keeps
+    // the event loop alive. Returns a promise a graceful-shutdown caller can
+    // await; ws-only callers get the prior synchronous teardown and can ignore
+    // the return value. _irohReady may still be resolving (bind mid-flight) — wait
+    // for it before closing so we never leak a just-bound endpoint.
+    if (this.IROH_ENABLED) {
+      return Promise.resolve(this._irohReady)
+        .then((t) => (t || this._irohTransport) && (t || this._irohTransport).close())
+        .catch(() => {});
+    }
+    return undefined;
   }
 }
 

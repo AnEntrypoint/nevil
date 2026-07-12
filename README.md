@@ -8,6 +8,13 @@ Two runtime dependencies: `ws` (WebSockets in Node — browsers have it
 natively) and `sodium-universal` (real, audited Ed25519/tweak
 primitives — native bindings in Node, WASM/JS in the browser).
 
+Optionally, a third: `@number0/iroh` enables an opt-in Node-only iroh
+QUIC transport (`irohEnabled: true`) with relay-assisted NAT
+hole-punching and Ed25519-`EndpointId` addressing that aligns with
+nevil's souls. It is an `optionalDependency` (native binding), so the
+default ws-only/browser path never needs it and the hard runtime
+dependency stays `sodium-universal` alone. See "Networking a peer" below.
+
 ## Layers
 
 | Layer | File | What it is |
@@ -219,6 +226,29 @@ const db = new Nevil({
   peers: ['ws://otherpeer.example.com/nevil'],
 });
 ```
+
+**Over iroh QUIC (optional, Node-only).** With `@number0/iroh` installed,
+opt into a QUIC transport with relay-assisted NAT hole-punching. iroh peers
+are addressed by Ed25519 `EndpointId` (which aligns with nevil's souls), and
+ride the exact same routing / reputation / PoW / signature-verification
+pipeline as ws peers — the transport swap changes bytes-on-wire only:
+
+```js
+const b = new Nevil({ file: './b/log.ndjson', peers: [], irohEnabled: true });
+await b.ready();
+const bAddr = await b.irohNodeAddr();       // b's dialable EndpointAddr
+
+const a = new Nevil({ file: './a/log.ndjson', peers: [], irohEnabled: true });
+await a.ready();
+await a.dialIroh(bAddr);                     // or pass irohPeers: [bAddr] at construction
+
+a.put('greeting', { text: 'hi over quic' }); // propagates to b over iroh
+```
+
+Set `irohRelay: false` for direct/LAN-only (no n0 relay dependency), and
+`irohSecretKey` (a 32-byte Ed25519 seed) to bind a node's `EndpointId`
+deterministically. iroh is an `optionalDependency`; the default ws path is
+untouched when `irohEnabled` is off.
 
 ## Installation
 
