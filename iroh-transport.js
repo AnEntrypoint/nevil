@@ -60,15 +60,16 @@ class IrohSocket {
    * write closes the socket rather than silently dropping into a black hole.
    */
   send(data) {
-    if (this.readyState !== 1) return;
+    if (this.readyState !== 1) return false;
     const body = Buffer.from(typeof data === 'string' ? data : String(data), 'utf8');
-    if (body.length > this._maxPayload) return; // symmetric with ws maxPayload — never emit an unframeable frame
+    if (body.length > this._maxPayload) return false; // symmetric with ws maxPayload — report the drop so metrics stay truthful
     const len = Buffer.alloc(4);
     len.writeUInt32BE(body.length, 0);
     const frame = toByteArray(Buffer.concat([len, body]));
     this._sendChain = this._sendChain.then(() => this._bi.send.writeAll(frame)).catch((e) => {
       this._fail(e);
     });
+    return true;
   }
 
   async _readLoop() {
@@ -144,7 +145,7 @@ class IrohTransport {
     const conn = await connecting.connect();
     const peerKey = IrohTransport.peerKeyOf(conn.remoteId());
     const bi = await conn.acceptBi();
-    this._register(conn, bi, peerKey);
+    this._register(conn, bi, peerKey, false);
   }
 
   /** Dial a peer by its EndpointAddr (from another node's transport.addr()). */
@@ -153,23 +154,40 @@ class IrohTransport {
     const alpn = toByteArray(Buffer.from(ALPN_STR, 'utf8'));
     const conn = await this._endpoint.connect(endpointAddr, alpn);
     const peerKey = IrohTransport.peerKeyOf(conn.remoteId());
-    if (this._byPeer.has(peerKey)) { try { conn.close(0, ''); } catch {} return; } // already connected — dedup
     const bi = await conn.openBi();
-    this._register(conn, bi, peerKey);
+    this._register(conn, bi, peerKey, true);
   }
 
-  _register(conn, bi, peerKey) {
-    if (this._byPeer.has(peerKey)) {
-      // Mutual-dial race: keep the existing socket, drop the duplicate so the
-      // same physical peer is never _attach()ed twice (routing/reputation would
-      // otherwise double-count it).
-      try { conn.close(0, ''); } catch {}
-      return;
+  /**
+   * A simultaneous mutual dial yields two physical connections for one peer; if
+   * each end keeps its own dialed one and closes the other, both retained sockets
+   * sit on a connection the remote already closed and the link dies. Converge both
+   * ends on the SAME survivor via a fixed total order on the two EndpointIds: the
+   * lower-id node keeps its DIALED connection, the higher-id node keeps the
+   * ACCEPTED one. Both compute the identical winner, so exactly one connection
+   * survives on both sides and neither closes the one its kept socket depends on.
+   */
+  _keepThisConn(conn, dialed) {
+    const lowerKeepsDialed = this.id() < conn.remoteId().toString();
+    return dialed ? lowerKeepsDialed : !lowerKeepsDialed;
+  }
+
+  _register(conn, bi, peerKey, dialed) {
+    const existing = this._byPeer.get(peerKey);
+    if (existing) {
+      if (!this._keepThisConn(conn, dialed)) { try { conn.close(0, ''); } catch {} return; }
+      // This connection is the deterministic winner but a losing socket registered
+      // first; replace it so the retained socket is on the surviving connection.
+      this._sockets.delete(existing);
+      try { existing.close(); } catch {}
     }
     const sock = new IrohSocket(conn, bi, peerKey, this._maxPayload);
     this._byPeer.set(peerKey, sock);
     this._sockets.add(sock);
-    sock.on('close', () => { this._sockets.delete(sock); this._byPeer.delete(peerKey); });
+    sock.on('close', () => {
+      this._sockets.delete(sock);
+      if (this._byPeer.get(peerKey) === sock) this._byPeer.delete(peerKey);
+    });
     this._onSocket(sock);
   }
 

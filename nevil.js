@@ -460,7 +460,7 @@ class Nevil {
    * could otherwise force a CA node's quorum gate to pass during a genuine
    * partition from its real configured peers, just by opening throwaway
    * connections. `network._dial()` stamps `ws._dialUrl` on every socket IT
-   * initiated (network.js:232); inbound/server-attached sockets never get
+   * initiated (see `network._dial()`); inbound/server-attached sockets never get
    * that property, so filtering on it (matched against the same configured
    * peer set `_quorumPeerCount()` uses as the denominator) restricts the
    * numerator to sockets that are actually one of the peers being quorate over.
@@ -985,7 +985,7 @@ class Nevil {
   /** Get reputation ledger entries: all entries if peerId is omitted, or only that peer's entries (matching network.js's own filtered signature) if given. */
   getReputationLedger(peerId) {
     const network = this._requireNetwork('getReputationLedger');
-    return peerId === undefined ? network.reputationLedger : network.getReputationLedger(peerId);
+    return peerId === undefined ? network.reputationLedger.slice() : network.getReputationLedger(peerId);
   }
 
   /** Merge remote reputation entries into the network ledger (for gossip). */

@@ -123,6 +123,7 @@ function resolveOne(graph, soul, q, depth, maxDepth) {
     maxDepth = typeof q.maxDepth === 'number' && q.maxDepth >= 0 ? q.maxDepth : 32;
   }
   const node = graph.get(soul);
+  if (!node) return null;
   if (depth > maxDepth) {
     // A node that the active filter would exclude must still be excluded at
     // the depth cutoff — returning the _depthExceeded stub before filtering

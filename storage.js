@@ -118,6 +118,35 @@ class NodeLogStore {
     await queue;
   }
 
+  /** Atomic read-modify-write ON the write queue: reads the current file, applies transform(entries), then temp-file+rename writes the result — all as ONE queued task, so no concurrent appendEntries/compact can interleave between the snapshot read and the rewrite. A bare readAll()+compact() runs the read and the write as separate queue tasks, letting an append land in the gap and be silently dropped by the rewrite (the compactReputationLog delta-loss race). */
+  async rewriteWith(transform) {
+    const queue = (this._writeQueue || Promise.resolve()).then(async () => {
+      const raw = await this.fs.promises.readFile(this.filePath, 'utf8');
+      const entries = [];
+      for (const line of raw.split('\n')) {
+        if (!line.trim()) continue;
+        try { entries.push(JSON.parse(line)); } catch {}
+      }
+      const out = transform(entries);
+      const lines = out.map((e) => JSON.stringify(e)).join('\n') + (out.length ? '\n' : '');
+      const tmpPath = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
+      if (this.fsyncOnWrite) {
+        const fh = await this.fs.promises.open(tmpPath, 'w');
+        try {
+          await fh.writeFile(lines, 'utf8');
+          await fh.sync();
+        } finally {
+          await fh.close();
+        }
+      } else {
+        await this.fs.promises.writeFile(tmpPath, lines, 'utf8');
+      }
+      await this.fs.promises.rename(tmpPath, this.filePath);
+    });
+    this._writeQueue = queue.catch(() => {});
+    await queue;
+  }
+
   /** Await the current tail of the write queue — lets a caller (Storage.close()) wait for an in-flight/queued appendEntries or compact to actually reach disk before tearing down, instead of racing process exit against a fire-and-forget persist(). Never rejects: a failed write already resolves its own awaiter via the un-reset queue reference in appendEntries/compact, so drain() only needs to know the queue is IDLE, not whether the last write succeeded. */
   async drain() {
     await (this._writeQueue || Promise.resolve()).catch(() => {});
@@ -184,6 +213,26 @@ class BrowserLogStore {
     const queue = (this._writeQueue || Promise.resolve()).then(run);
     // Reset on failure — see NodeLogStore.appendEntries for why an unguarded
     // reassignment here would permanently poison every future write.
+    this._writeQueue = queue.catch(() => {});
+    return queue;
+  }
+
+  /** Atomic read-modify-write on the write queue — same contract as NodeLogStore.rewriteWith(): reads the store, applies transform, and overwrites, all within the SAME queued readwrite transaction so no concurrent append interleaves between snapshot and rewrite. */
+  async rewriteWith(transform) {
+    const run = () => this._ready.then((db) => new Promise((resolve, reject) => {
+      const tx = db.transaction('log', 'readwrite');
+      const store = tx.objectStore('log');
+      const getReq = store.getAll();
+      getReq.onsuccess = () => {
+        const out = transform(getReq.result);
+        store.clear();
+        for (const e of out) store.add(e);
+      };
+      getReq.onerror = () => reject(getReq.error);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    }));
+    const queue = (this._writeQueue || Promise.resolve()).then(run);
     this._writeQueue = queue.catch(() => {});
     return queue;
   }
@@ -374,19 +423,23 @@ class Storage {
    * to reach it; the most recent reason/timestamp is kept for diagnostics.
    */
   async compactReputationLog() {
-    const entries = await this.reputationLog.readAll();
-    const summed = new Map(); // peerId -> { peerId, delta, reason, timestamp }
-    for (const entry of entries) {
-      if (!entry || typeof entry.peerId !== 'string' || typeof entry.delta !== 'number') continue;
-      const prior = summed.get(entry.peerId);
-      summed.set(entry.peerId, {
-        peerId: entry.peerId,
-        delta: (prior ? prior.delta : 0) + entry.delta,
-        reason: entry.reason,
-        timestamp: entry.timestamp,
-      });
-    }
-    await this.reputationLog.compact(Array.from(summed.values()));
+    // rewriteWith runs read+sum+rewrite as ONE queued write task, so a
+    // concurrent persistReputationEntry() append can never land between the
+    // snapshot read and the rewrite and be silently dropped by it.
+    await this.reputationLog.rewriteWith((entries) => {
+      const summed = new Map(); // peerId -> { peerId, delta, reason, timestamp }
+      for (const entry of entries) {
+        if (!entry || typeof entry.peerId !== 'string' || typeof entry.delta !== 'number') continue;
+        const prior = summed.get(entry.peerId);
+        summed.set(entry.peerId, {
+          peerId: entry.peerId,
+          delta: (prior ? prior.delta : 0) + entry.delta,
+          reason: entry.reason,
+          timestamp: entry.timestamp,
+        });
+      }
+      return Array.from(summed.values());
+    });
   }
 
   /**

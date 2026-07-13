@@ -287,54 +287,24 @@ class BTreeIndex {
   }
 
   /**
-   * Get entry for a soul: binary-search SSTables for a fast candidate, then
-   * always compare it (and any other table whose range contains the soul)
-   * against the memtable entry by timestamp — mirroring _collectPairs'
-   * timestamp-based dedup used by rangeScan/prefixScan. Two un-compacted
-   * SSTables can share the same minSoul (the same soul flushed twice before
-   * SSTABLE_MERGE_THRESHOLD merges them), and _insertSSTable's tie-break
-   * does not guarantee the newer of a tied pair sorts where the binary
-   * search below would land on it first — trusting the first hit
-   * unconditionally can return stale data. A plain memtable-always-wins
-   * shortcut has the same defect if the memtable ever holds an older
-   * timestamp for a soul than an already-flushed SSTable (e.g. after a
-   * rebuild() replay). Comparing timestamps across every candidate, exactly
-   * like the range/prefix scan path already does, keeps get() consistent
-   * with them on identical index state.
+   * Get entry for a soul: compare the memtable entry against every SSTable
+   * whose range contains the soul, keeping the newest by timestamp —
+   * mirroring _collectPairs' timestamp-based dedup used by rangeScan/prefixScan.
+   * Compaction merges tables by age, not always preserving strictly sorted,
+   * non-overlapping [minSoul, maxSoul] ranges, and un-compacted flushes can
+   * leave multiple tables with overlapping/tied ranges for the same soul (the
+   * same soul flushed twice before SSTABLE_MERGE_THRESHOLD merges them), so a
+   * hit on one table must never shadow a newer value sitting in another. A
+   * plain memtable-always-wins shortcut has the same defect if the memtable
+   * holds an older timestamp than an already-flushed SSTable (e.g. after a
+   * rebuild() replay). Comparing timestamps across every candidate keeps get()
+   * consistent with the range/prefix scan path on identical index state.
    */
   get(soul) {
     let best;
     const inMemtable = this.memtable.get(soul);
     if (inMemtable) best = inMemtable;
 
-    // sstables is sorted ascending by minSoul: find the rightmost table whose
-    // range can contain the soul as a fast-path candidate.
-    let lo = 0;
-    let hi = this.sstables.length - 1;
-    let cand = -1;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      if (this.sstables[mid].minSoul <= soul) {
-        cand = mid;
-        lo = mid + 1;
-      } else {
-        hi = mid - 1;
-      }
-    }
-    if (cand >= 0) {
-      const t = this.sstables[cand];
-      if (soul <= t.maxSoul) {
-        const entry = t.index.get(soul);
-        if (entry && (!best || (entry.timestamp || 0) >= (best.timestamp || 0))) best = entry;
-      }
-    }
-    // Compaction merges tables by age, not always in a way that preserves
-    // strictly sorted, non-overlapping [minSoul, maxSoul] ranges relative to
-    // every other table, and un-compacted flushes can leave multiple tables
-    // with overlapping/tied ranges for the same soul. The binary search
-    // above is a fast-path candidate, not the final answer: scan every table
-    // whose range could contain the soul and keep the newest entry, so a hit
-    // on one table never shadows a newer value sitting in another.
     for (const t of this.sstables) {
       if (soul < t.minSoul || soul > t.maxSoul) continue;
       const entry = t.index.get(soul);

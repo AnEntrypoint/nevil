@@ -7,7 +7,8 @@
  * Conflict ordering is clock > timestamp > value (lexical): the higher
  * Lamport clock wins, ties broken by timestamp, then by canonical value
  * so concurrent writes converge identically on every peer even across
- * clock skew and without coordination. Relationships between nodes are
+ * clock skew and without coordination. AsyncLocalStorage backs withSoulLock's
+ * reentrancy tracking. Relationships between nodes are
  * just fields whose value is a soul-reference: { '#': 'node-id' }.
  *
  * This module is intentionally the only place that understands HAM and
@@ -155,13 +156,31 @@ class Graph {
    */
   async withSoulLock(soul, fn) {
     this._soulLocks = this._soulLocks || new Map();
+    // Reentrancy: a call nested inside an fn that already holds this soul's
+    // lock (same async context) would otherwise await its OWN outstanding
+    // `mine` promise, which can't resolve until the outer fn returns — a
+    // self-deadlock. Track held souls per async context via AsyncLocalStorage
+    // so a same-soul re-entry passes straight through instead of queuing.
+    if (this._soulLockStore === undefined) {
+      // async_hooks is Node-only; a browser has no re-entrant same-async-
+      // context caller to protect (this lock's use case is a Node async
+      // pipeline), so absence degrades to non-reentrant, not a crash.
+      try { this._soulLockStore = new (require('async_hooks').AsyncLocalStorage)(); }
+      catch { this._soulLockStore = null; }
+    }
+    const held = this._soulLockStore ? this._soulLockStore.getStore() : null;
+    if (held && held.has(soul)) return fn();
     const prior = this._soulLocks.get(soul) || Promise.resolve();
     let release;
     const mine = prior.then(() => new Promise((resolve) => { release = resolve; }));
     this._soulLocks.set(soul, mine);
     await prior;
+    const nextHeld = new Set(held || []);
+    nextHeld.add(soul);
     try {
-      return await fn();
+      return this._soulLockStore
+        ? await this._soulLockStore.run(nextHeld, fn)
+        : await fn();
     } finally {
       release();
       if (this._soulLocks.get(soul) === mine) this._soulLocks.delete(soul);
@@ -260,6 +279,10 @@ class Graph {
     // (e.g. Number.MAX_SAFE_INTEGER-class poisoning) that Number.isFinite
     // alone would let through.
     const ABSOLUTE_TS_SANITY_CEILING = 253402300799999; // year 9999 (fixed constant, not wall-clock)
+    // Receiver-independent absolute ceiling for the STORED lamport of a field
+    // with no prior lamport history — nothing peer-shared to anchor to, so a
+    // fixed constant identical on every peer, never receive-time localClock.
+    const ABSOLUTE_LAMPORT_SANITY_CEILING = Number.MAX_SAFE_INTEGER;
 
     const changed = [];
     for (const field of fieldNames) {
@@ -295,24 +318,36 @@ class Graph {
         this._warnRejected(`field '${field}' has a non-finite lamport clock, skipping`);
         continue;
       }
-      // Byzantine clock guard: a peer advertising an implausibly large jump
-      // ahead of our own clock would otherwise win every future HAM
-      // comparison for this field forever (CLOCK_MAX_JUMP was previously
-      // declared but never enforced). Clamp the accepted clock to at most
-      // CLOCK_MAX_JUMP past our localClock-at-entry so one malicious message
-      // can't permanently poison a field's conflict-resolution ordering.
-      if (incomingClock !== undefined && incomingClock > perFieldCeiling) {
-        incomingClock = perFieldCeiling;
-      }
       const currentLamport = this.nodes.get(soul)?.lamport[field];
+      // Byzantine clock guard for the STORED value: clamp the accepted clock
+      // against THIS FIELD's own recorded lamport history (currentLamport +
+      // CLOCK_MAX_JUMP), not the receiver-local clockAtEntry-derived ceiling.
+      // currentLamport (like currentFieldTs) only advances via messages
+      // actually merged, so it is identical on every peer that merged the same
+      // prior history — the value written into node.lamport[field] is then
+      // peer-independent and CRDT convergence holds. A field with no prior
+      // lamport has nothing peer-shared to anchor to, so only the fixed
+      // absolute sanity ceiling applies. The localClock advance below still
+      // uses the receiver-local perFieldCeiling, which never leaves this node.
+      const storedCeiling = currentLamport !== undefined
+        ? currentLamport + this.CLOCK_MAX_JUMP
+        : ABSOLUTE_LAMPORT_SANITY_CEILING;
+      let storedClock = incomingClock;
+      if (storedClock !== undefined && storedClock > storedCeiling) {
+        storedClock = storedCeiling;
+      }
       // maxAcceptedClock only tracks clocks from fields mergeField actually
       // accepted — a rejected/losing write must not contribute to the clock
       // advance below, or a stream of garbage-ts/FWW-losing messages could
-      // silently ratchet localClock with zero real data ever landing.
-      if (this.mergeField(soul, field, fields[field], ts, incomingClock, currentLamport)) {
+      // silently ratchet localClock with zero real data ever landing. Its
+      // contribution stays bounded by the receiver-local perFieldCeiling.
+      if (this.mergeField(soul, field, fields[field], ts, storedClock, currentLamport)) {
         changed.push(field);
-        if (incomingClock !== undefined && incomingClock > maxAcceptedClock) {
-          maxAcceptedClock = incomingClock;
+        const advanceContribution = storedClock !== undefined && storedClock > perFieldCeiling
+          ? perFieldCeiling
+          : storedClock;
+        if (advanceContribution !== undefined && advanceContribution > maxAcceptedClock) {
+          maxAcceptedClock = advanceContribution;
         }
       }
     }
@@ -384,11 +419,16 @@ class Graph {
    * would also prevent every OTHER subscriber (and the caller's post-merge
    * relay logic) from running at all.
    *
-   * Each listener also receives its OWN shallow copy of the node, not a
-   * shared reference — this.get(soul) is called fresh per invocation, so an
-   * in-place field mutation by one listener (e.g. normalizing a value before
-   * use) can never leak into what a later listener in the same notify pass
-   * observes, including unrelated wildcard listeners.
+   * Each listener also receives its OWN SHALLOW copy of the node, not a
+   * shared reference — this.get(soul) is called fresh per invocation. This
+   * isolates only top-level field REPLACEMENT: a listener reassigning a
+   * scalar/ref field on its copy can never leak into a later listener. It
+   * does NOT isolate in-place mutation of a nested object-typed field value:
+   * the shallow copy shares that nested object by reference with every other
+   * listener copy, every wildcard listener, AND the canonical store
+   * (this.nodes.get(soul).data holds the same reference). A listener doing
+   * node.obj.x = 1 therefore corrupts sibling views AND the graph itself.
+   * Contract: treat every nested field object as read-only inside a listener.
    */
   _notify(soul, changedFields) {
     this.listeners.get(soul)?.forEach((fn) => {

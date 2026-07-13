@@ -141,6 +141,7 @@ class Network {
     this.REP_DELTA_REPLAY = opts.repDeltaReplay || -5; // -5 for replay/duplicate
     this.REP_DELTA_BYZANTINE = opts.repDeltaByzantine || -3; // -3 for Byzantine behavior
     this.REP_DELTA_ROUTING_HELP = opts.repDeltaRoutingHelp || 10; // +10 for routing help
+    this.REP_MAX_POSITIVE = opts.repMaxPositive || 20; // ceiling on the accept buffer, mirroring the drop-threshold self-limit on the negative side
     this.QUEUE_RETRY_DELAY = opts.queueRetryDelay || 5000; // retry queued messages every 5s
     this.QUEUE_MAX_RETRIES = opts.queueMaxRetries || 5; // max retries before drop
 
@@ -199,10 +200,27 @@ class Network {
    * gossiping a stream of fabricated peerIds could grow it without limit.
    */
   _setReputationCache(peerId, value) {
+    // Cap the accept buffer so a peer can't pre-farm unbounded positive
+    // reputation and then absorb many penalties without ever throttling.
+    if (value > this.REP_MAX_POSITIVE) value = this.REP_MAX_POSITIVE;
     if (!this.reputationCache.has(peerId)) {
       this.reputationCacheOrder.push(peerId);
       if (this.reputationCacheOrder.length > this.maxReputationLedger) {
-        this.reputationCache.delete(this.reputationCacheOrder.shift());
+        // FIFO pressure must never upgrade a throttled peer to accept: skip
+        // (re-queue) any peerId currently below the accept threshold when
+        // choosing an eviction victim, so a Byzantine/drop-throttled peer
+        // stays pinned. If every candidate is pinned (cache full of
+        // negatives), evict the oldest anyway to bound growth.
+        const order = this.reputationCacheOrder;
+        let victimIdx = 0;
+        while (victimIdx < order.length - 1) {
+          const cand = order[victimIdx];
+          const rep = this.reputationCache.get(cand);
+          if (rep === undefined || rep >= this.REP_ACCEPT_THRESHOLD) break;
+          victimIdx++;
+        }
+        const victim = order.splice(victimIdx, 1)[0];
+        this.reputationCache.delete(victim);
       }
     }
     this.reputationCache.set(peerId, value);
@@ -382,7 +400,11 @@ class Network {
         // {id} frame, silently suppressing the DHT_FALLBACK_THRESHOLD
         // reflood safety net for a message that never actually propagated.
         const expectedDigest = this._sentDigests?.get(msg.id);
-        const digestMatches = expectedDigest === undefined || expectedDigest === canonicalJSON({ soul: msg.soul, fields: msg.fields, ts: msg.ts });
+        // An ABSENT digest means this node never broadcast this message, so a
+        // loop-back of it proves nothing about OUR propagation — it must fail,
+        // not pass, or any foreign-origin duplicate would forge an ACK and farm
+        // routing-help reputation for free.
+        const digestMatches = expectedDigest !== undefined && expectedDigest === canonicalJSON({ soul: msg.soul, fields: msg.fields, ts: msg.ts });
         if (notADirectTarget && digestMatches) {
           this._ackedIds = this._ackedIds || new Set();
           const firstAck = !this._ackedIds.has(msg.id);
@@ -875,9 +897,10 @@ class Network {
       const state = ws.readyState;
       if (state === 1 /* OPEN */) {
         try {
-          ws.send(data);
-          this.metrics.messagesSent++;
-          this.metrics.bytesSent += data.length;
+          if (ws.send(data) !== false) {
+            this.metrics.messagesSent++;
+            this.metrics.bytesSent += data.length;
+          }
           const sendMs = Date.now() - sendStart;
           this._recordLatency('send_ms', sendMs);
         } catch {
@@ -1017,19 +1040,10 @@ class Network {
     // GEOHASH_LENGTH) instead of a hardcoded 4 — previously the config option
     // was accepted and stored but the two geohash paths both hardcoded a
     // 4-char prefix, so setting dhtGeohashLength had no effect on bucketing.
-    const len = this.DHT_GEOHASH_LENGTH;
-    if (this._isKeychainDerived(soul)) {
-      return soul.substring(0, len);
-    }
-    // Fallback: FNV-1a over the FULL soul (not just its first chars) —
-    // hashing only a short prefix meant distinct souls sharing that prefix
-    // collided into the same bucket regardless of the rest of the string.
-    let hash = 0x811c9dc5;
-    for (let i = 0; i < soul.length; i++) {
-      hash ^= soul.charCodeAt(i);
-      hash = Math.imul(hash, 0x01000193);
-    }
-    return (hash >>> 0).toString(16).padStart(8, '0').substring(0, len);
+    // Every caller pre-guards on _isKeychainDerived(soul), so soul is always a
+    // 64-hex keychain pubkey here — a prefix of it is a valid deterministic
+    // bucket. Non-keychain souls flood-fill and never reach this method.
+    return soul.substring(0, this.DHT_GEOHASH_LENGTH);
   }
 
   _recordLatency(op, ms) {

@@ -361,6 +361,7 @@ class Keychain {
 
   /** A new sub-Keychain, tweaked by a label. Chainable: keys.sub('a').sub('b'). */
   sub(label) {
+    if (label === undefined) throw new TypeError('sub() requires a label; use get() for the untweaked head');
     const child = Object.create(Keychain.prototype);
     child.home = this.home;
     child.base = this.get(); // fold in the current tweak before descending
