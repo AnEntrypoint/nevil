@@ -1,0 +1,25 @@
+{
+  "name": "nevil",
+  "version": "1.0.0",
+  "description": "A monolithic, from-scratch replacement for the GUN ecosystem: graph engine + SEA-equivalent crypto + RAD-equivalent storage + DAM/AXE-equivalent networking + keypear-style deterministic hierarchical keychains as the primary identity/addressing system, with a GraphQL-shaped query layer. One cohesive codebase.",
+  "main": "nevil.js",
+  "scripts": {},
+  "dependencies": {
+    "sodium-universal": "^5.0.1"
+  },
+  "peerDependencies": {
+    "ws": "^8.18.0"
+  },
+  "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=19"
+  },
+  "license": "MIT",
+  "optionalDependencies": {
+    "@number0/iroh": "^1.0.0"
+  }
+}
