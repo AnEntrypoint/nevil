@@ -66,8 +66,15 @@ class Network {
     this.seenOrder = []; // bounded FIFO so `seen` doesn't grow forever
     this.maxSeen = 5000;
     this.metrics = { messagesReceived: 0, messagesSent: 0, bytesSent: 0, peersConnected: 0 };
-    this.latencies = { send_ms: [], receive_ms: [] }; // ring buffers for latency tracking
-    this.maxLatencySamples = 1000; // keep last 1000 samples per operation
+    this.latencies = { send_ms: [], receive_ms: [] }; // bounded sample buffers for latency tracking
+    this.maxLatencySamples = 1000; // keep roughly the last 1000 samples per operation
+    // Trimmed in batches (see _recordLatency), not one Array.shift() per
+    // sample: shifting a single element off a ~1000-long array is O(n), and
+    // this runs on every send/receive once the buffer is full — i.e. on
+    // every relayed message in steady state. Allowing a bounded overflow
+    // before one batched splice() amortizes that O(n) cost across many
+    // pushes instead of paying it every single one.
+    this._latencyEvictBatch = Math.max(1, Math.floor(this.maxLatencySamples * 0.1));
     // Caps the raw WebSocket frame size at the transport layer (ws's own
     // maxPayload) so a single oversized field value can't be used to exhaust
     // memory/disk/bandwidth before any application-level check ever runs —
@@ -864,6 +871,19 @@ class Network {
   }
 
   _updateBackpressure() {
+    // getMetrics() sorts up to maxLatencySamples (1000) entries per latency
+    // bucket; _relay() calls this on every single relayed message, so under
+    // sustained throughput this was a full re-sort per broadcast for a
+    // multiplicative adjustment (+-5-10%) that only meaningfully moves on the
+    // timescale of the underlying latency signal, not per-message. Throttle
+    // to backpressureUpdateIntervalMs (default 50ms) — real degradation is
+    // still caught within a fraction of a second, without re-sorting on
+    // every message when many are relayed inside that window.
+    const now = Date.now();
+    const interval = this.opts.backpressureUpdateIntervalMs ?? 50;
+    if (this._lastBackpressureUpdate !== undefined && now - this._lastBackpressureUpdate < interval) return;
+    this._lastBackpressureUpdate = now;
+
     // If p99 latency exceeds 100ms, reduce write rate by 10%
     const metrics = this.getMetrics();
     const p99 = Math.max(
@@ -1021,9 +1041,14 @@ class Network {
     const useBucket = bucketedKeys.length >= Math.ceil(K / 2);
     const candidateKeys = useBucket ? bucketedKeys : ranked.map(e => e.pk);
 
-    const rankedCandidates = candidateKeys
-      .map(pk => ranked.find(e => e.pk === pk))
-      .filter(Boolean);
+    // _getPrefixMatches filters its input with Array.prototype.filter, which
+    // preserves relative order — candidateKeys is already a subset of ranked
+    // in ranked's own order, so re-deriving that order via O(n) .find() per
+    // key (O(n^2) total as connected-peer count grows) is redundant; a
+    // membership Set plus one O(n) filter over ranked gives the identical
+    // order in O(n).
+    const candidateKeySet = new Set(candidateKeys);
+    const rankedCandidates = ranked.filter(e => candidateKeySet.has(e.pk));
 
     for (let i = 0; i < Math.min(K, rankedCandidates.length); i++) selected.add(rankedCandidates[i].pk);
     for (let i = 0; i < L && (K + i) < ranked.length; i++) selected.add(ranked[K + i].pk);
@@ -1047,10 +1072,10 @@ class Network {
   }
 
   _recordLatency(op, ms) {
-    this.latencies[op].push(ms);
-    if (this.latencies[op].length > this.maxLatencySamples) {
-      this.latencies[op].shift();
-    }
+    const arr = this.latencies[op];
+    arr.push(ms);
+    const overflow = arr.length - this.maxLatencySamples;
+    if (overflow >= this._latencyEvictBatch) arr.splice(0, overflow);
   }
 
   _computePercentile(arr, p) {
@@ -1060,19 +1085,23 @@ class Network {
     return sorted[Math.max(0, idx)];
   }
 
+  /** p50/p90/p99 off ONE sort of `arr` instead of the naive 3 (one per percentile via _computePercentile). */
+  _computePercentiles(arr) {
+    if (arr.length === 0) return { p50: 0, p90: 0, p99: 0 };
+    const sorted = [...arr].sort((a, b) => a - b);
+    const at = (p) => sorted[Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)];
+    return { p50: at(50), p90: at(90), p99: at(99) };
+  }
+
   getMetrics() {
-    const p50send = this._computePercentile(this.latencies.send_ms, 50);
-    const p90send = this._computePercentile(this.latencies.send_ms, 90);
-    const p99send = this._computePercentile(this.latencies.send_ms, 99);
-    const p50recv = this._computePercentile(this.latencies.receive_ms, 50);
-    const p90recv = this._computePercentile(this.latencies.receive_ms, 90);
-    const p99recv = this._computePercentile(this.latencies.receive_ms, 99);
+    const send = this._computePercentiles(this.latencies.send_ms);
+    const recv = this._computePercentiles(this.latencies.receive_ms);
     return {
       ...this.metrics,
       writeRateScale: this.writeRateScale,
       latencies: {
-        send_ms: { p50: p50send, p90: p90send, p99: p99send, samples: this.latencies.send_ms.length },
-        receive_ms: { p50: p50recv, p90: p90recv, p99: p99recv, samples: this.latencies.receive_ms.length }
+        send_ms: { ...send, samples: this.latencies.send_ms.length },
+        receive_ms: { ...recv, samples: this.latencies.receive_ms.length }
       }
     };
   }

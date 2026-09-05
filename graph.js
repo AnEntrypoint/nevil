@@ -431,20 +431,33 @@ class Graph {
    * Contract: treat every nested field object as read-only inside a listener.
    */
   _notify(soul, changedFields) {
-    this.listeners.get(soul)?.forEach((fn) => {
-      try {
-        fn(this.get(soul), changedFields);
-      } catch (err) {
-        this._warnRejected(`listener for soul '${soul}' threw: ${err?.message || err}`);
-      }
-    });
-    this.wildcardListeners.forEach((fn) => {
-      try {
-        fn(soul, this.get(soul), changedFields);
-      } catch (err) {
-        this._warnRejected(`wildcard listener threw: ${err?.message || err}`);
-      }
-    });
+    const hasSoulListeners = this.listeners.has(soul);
+    const hasWildcardListeners = this.wildcardListeners.size > 0;
+    if (!hasSoulListeners && !hasWildcardListeners) return;
+    // node.data itself never changes mid-notify (mergeNode/mergeField already
+    // ran to completion), so the underlying fields are stable across every
+    // listener call here — only the isolating top-level copy needs to be
+    // fresh per listener (see class doc: a listener reassigning its own
+    // copy's scalar/ref field must never leak into a sibling's copy).
+    const data = this.nodes.get(soul)?.data;
+    if (hasSoulListeners) {
+      this.listeners.get(soul).forEach((fn) => {
+        try {
+          fn(data ? { ...data } : undefined, changedFields);
+        } catch (err) {
+          this._warnRejected(`listener for soul '${soul}' threw: ${err?.message || err}`);
+        }
+      });
+    }
+    if (hasWildcardListeners) {
+      this.wildcardListeners.forEach((fn) => {
+        try {
+          fn(soul, data ? { ...data } : undefined, changedFields);
+        } catch (err) {
+          this._warnRejected(`wildcard listener threw: ${err?.message || err}`);
+        }
+      });
+    }
   }
 }
 

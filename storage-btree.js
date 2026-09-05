@@ -16,6 +16,7 @@ class BTreeIndex {
   constructor(opts = {}) {
     this.memtable = new Map(); // soul -> {data, state, timestamp}
     this.memtableSize = 0;
+    this.memtableEntrySizes = new Map(); // soul -> cached JSON.stringify(entry).length, avoids re-serializing the OLD entry on every overwrite just to subtract its size
 
     // Tuning parameters (configurable per deployment).
     this.MEMTABLE_SIZE_LIMIT = opts.memtableSizeLimit || 10 * 1024 * 1024; // 10MB default
@@ -148,11 +149,12 @@ class BTreeIndex {
 
   /** Write entry to memtable. Returns true if a flush should follow. */
   write(soul, entry) {
-    const existing = this.memtable.get(soul);
-    if (existing) this.memtableSize -= soul.length + JSON.stringify(existing).length + 100;
+    const existingSize = this.memtableEntrySizes.get(soul);
+    if (existingSize !== undefined) this.memtableSize -= existingSize;
     this.memtable.set(soul, entry);
 
     const entrySize = soul.length + JSON.stringify(entry).length + 100;
+    this.memtableEntrySizes.set(soul, entrySize);
     this.memtableSize += entrySize;
 
     const now = Date.now();
@@ -192,6 +194,7 @@ class BTreeIndex {
       ? this.sstables.map((t) => t._fileId).filter((id) => id !== undefined)
       : [];
     this.memtable.clear();
+    this.memtableEntrySizes.clear();
     this.memtableSize = 0;
     this.sstables = [];
     // Use write()/flushMemtable()/compactSSTables() directly instead of
@@ -270,6 +273,7 @@ class BTreeIndex {
     this._insertSSTable(table);
 
     this.memtable.clear();
+    this.memtableEntrySizes.clear();
     this.memtableSize = 0;
     this.memtableFlushTime = Date.now();
 

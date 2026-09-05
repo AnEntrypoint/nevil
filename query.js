@@ -224,6 +224,9 @@ function resolveOne(graph, soul, q, depth, maxDepth) {
  * - mapToRows: boolean (if true, strips 'soul' and returns { row1: v1, row2: v2, ... })
  */
 function query(graph, q) {
+  if (q === null || typeof q !== 'object' || Array.isArray(q)) {
+    throw new TypeError('query: q must be a plain object (e.g. { soul, select } or { souls, select })');
+  }
   let results;
   if (Array.isArray(q.souls)) {
     // Dedup duplicate souls in the input array — the nested `list`-selection
