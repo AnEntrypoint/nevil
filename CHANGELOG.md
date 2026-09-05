@@ -2,7 +2,21 @@
 
 All notable changes to nevil are documented here. Changes are listed by date in reverse chronological order (newest first).
 
-## [Unreleased] — 2026-07-12
+## [Unreleased] — 2026-09-05
+
+### Fixed
+
+- **crypto.js was entirely missing from the repository** despite `nevil.js` unconditionally `require('./crypto')`-ing it and both AGENTS.md and this changelog documenting its behavior in detail — the package could not be `require`d at all (`MODULE_NOT_FOUND` on load, so `createIdentityFromSeed({passphrase})`/`unlock()` and every path through them were completely dead). Restored from the documented contract: `encryptWithPass(data, passphrase, saltB64?)`/`decryptWithPass(payload, passphrase)` doing PBKDF2-SHA256 (210000 iterations, capped at 5,000,000 on an untrusted `payload.iterations` to close the DoS this changelog previously described) -> AES-256-GCM via `globalThis.crypto.subtle`, passphrase NFC-normalization, a legacy-payload `iterations` default, an explicit throw when `JSON.stringify(data)` returns `undefined` at the root, and `saltB64` validation (non-empty, minimum decoded length). Witnessed live: `createIdentity`/`unlock` round-trip across two `Nevil` instances, wrong-passphrase rejection, legacy payload without an `iterations` field, and a hostile `Number.MAX_SAFE_INTEGER` `iterations` claim resolving in bounded time instead of hanging. Full 23-script witness suite passes.
+- **query.js**: `query()`/`select()` now validate `q` is a plain object up front, throwing the same actionable `TypeError` style every other public method (`put`/`link`/`delete`) already uses, instead of a bare "Cannot read properties of undefined" for `query(undefined)`/`query('x')`.
+
+### Performance
+
+- **nevil.js** (`graph.onAny` local-write handler, the hottest path in the system — runs on every `put`/`insert`/`update`/`putTxn`): stopped calling `graph.getState(soul)` (a full `{ ...state }` copy) once per changed field; reads the already-fetched `graphNode.state[f]` directly instead, removing O(fields²) copying per write.
+- **graph.js** (`_notify`): skips building any node copy at all when a soul has no listeners and no wildcard listeners are registered (the common case), and no longer re-fetches the node from `this.nodes` once per listener.
+- **network.js** (`_relay`, called on every relayed/broadcast message): `_updateBackpressure()` was re-sorting up to 6 latency-sample arrays (via 3 separate `_computePercentile` calls per array) on every single message; now sorts each array once for all three percentiles (`_computePercentiles`) and throttles the whole backpressure recomputation to once per `backpressureUpdateIntervalMs` (default 50ms, configurable) instead of once per message.
+- **network.js** (`_recordLatency`): replaced the per-sample `Array.shift()` (O(n), paid on effectively every send/receive once the 1000-sample buffer is full) with a batched `splice()` that trims once every ~10% overflow, amortizing the O(n) cost across many pushes.
+- **network.js** (`_selectRoutingPeers`): replaced an O(n²) `candidateKeys.map(pk => ranked.find(...))` re-lookup with an O(n) `Set`-membership filter over the already-ordered `ranked` array (order-preserving, since `_getPrefixMatches` only filters its input).
+- **storage-btree.js** (`BTreeIndex.write`, called on every persisted write when `enableSoulIndex` is on): was calling `JSON.stringify` twice per write (once to measure the outgoing entry's size, once to re-measure the entry being replaced, purely to subtract it back out); now caches each soul's last-computed size in a parallel map so an overwrite only serializes the new entry once.
 
 ### Added
 

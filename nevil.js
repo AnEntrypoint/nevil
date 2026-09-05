@@ -188,7 +188,10 @@ class Nevil {
       const graphNode = this.graph.nodes.get(soul);
       for (const f of changedFields) {
         fields[f] = node[f];
-        ts[f] = this.graph.getState(soul)[f];
+        // graphNode is the same Map entry getState(soul) would shallow-copy
+        // fresh on every call — read its state map directly instead of
+        // reallocating a full { ...state } copy once per changed field.
+        ts[f] = graphNode?.state[f];
         lamport[f] = graphNode?.lamport[f];
       }
       // persist() also updates the soul index with real entry data. Not
